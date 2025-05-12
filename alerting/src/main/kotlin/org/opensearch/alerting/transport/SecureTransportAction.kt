@@ -122,7 +122,7 @@ interface SecureTransportAction {
         if (
             resourceBackendRoles == null ||
             requesterBackendRoles == null ||
-            resourceBackendRoles.intersect(requesterBackendRoles).isEmpty()
+            !resourceBackendRoles.equals(requesterBackendRoles)
         ) {
             actionListener.onFailure(
                 AlertingException.wrap(

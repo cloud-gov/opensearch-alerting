@@ -55,7 +55,13 @@ object QueryLevelMonitorRunner : MonitorRunner() {
             return monitorResult.copy(error = e)
         }
         if (!isADMonitor(monitor)) {
-            withClosableContext(InjectorContextElement(monitor.id, monitorCtx.settings!!, monitorCtx.threadPool!!.threadContext, roles, monitor.user)) {
+            withClosableContext(InjectorContextElement(
+                monitor.id,
+                monitorCtx.settings!!,
+                monitorCtx.threadPool!!.threadContext,
+                roles,
+                monitor.user
+            )) {
                 monitorResult = monitorResult.copy(
                     inputResults = monitorCtx.inputService!!.collectInputResults(monitor, periodStart, periodEnd, null, workflowRunContext)
                 )

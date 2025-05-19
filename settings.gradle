@@ -14,3 +14,5 @@ project(":spi").name = 'alerting-spi'
 include 'sample-remote-monitor-plugin'
 project(":sample-remote-monitor-plugin").name = "alerting-sample-remote-monitor-plugin"
 // startParameter.excludedTaskNames=["generatePomFileForShadowPublication"]
+
+startParameter.excludedTaskNames += ["ktlint","alertingBwcCluster#oldVersionClusterTask1","alertingBwcCluster#fullRestartClusterTask","alertingBwcCluster#oldVersionClusterTask0","alertingBwcCluster#mixedClusterTask","alertingBwcCluster#twoThirdsUpgradedClusterTask","alertingBwcCluster#rollingUpgradeClusterTask","integTest","licenseHeaders","test"]

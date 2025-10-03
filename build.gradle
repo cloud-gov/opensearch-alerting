@@ -28,7 +28,7 @@ buildscript {
 
     repositories {
         mavenLocal()
-        maven { 
+        maven {
             url "https://ci.opensearch.org/ci/dbc/snapshots/maven/"
             mavenContent {
                 snapshotsOnly()
@@ -91,7 +91,7 @@ task ktlint(type: JavaExec, group: "verification") {
     mainClass = "com.pinterest.ktlint.Main"
     classpath = configurations.ktlint
     args "alerting/**/*.kt", "elastic-api/**/*.kt", "core/**/*.kt"
-    
+
     // Skip on JDK 25
     onlyIf {
         JavaVersion.current() < JavaVersion.VERSION_25
@@ -103,7 +103,7 @@ task ktlintFormat(type: JavaExec, group: "formatting") {
     mainClass = "com.pinterest.ktlint.Main"
     classpath = configurations.ktlint
     args "-F", "alerting/**/*.kt", "elastic-api/**/*.kt", "core/**/*.kt"
-    
+
     // Skip on JDK 25 until ktlint fully supports it
     onlyIf {
         JavaVersion.current() < JavaVersion.VERSION_25

@@ -196,6 +196,7 @@ class TransportDocLevelMonitorFanOutAction
 
     @Volatile
     override var filterByEnabled = AlertingSettings.FILTER_BY_BACKEND_ROLES.get(settings)
+    @Volatile override var filterByAccessStrategy = AlertingSettings.FILTER_BY_BACKEND_ROLES_ACCESS_STRATEGY.get(settings)
 
     override fun doExecute(
         task: Task,
@@ -400,7 +401,7 @@ class TransportDocLevelMonitorFanOutAction
             } else {
                 listOf()
             }
-            val triggerCtx = DocumentLevelTriggerExecutionContext(monitor, trigger)
+            val triggerCtx = DocumentLevelTriggerExecutionContext(monitor, trigger, clusterSettings = clusterService.clusterSettings)
             val alert = alertService.composeDocLevelAlert(
                 findingIds!!,
                 triggerResult.triggeredDocs,
@@ -445,7 +446,7 @@ class TransportDocLevelMonitorFanOutAction
         findingIdToDocSource: MutableMap<String, MultiGetItemResponse>,
         workflowRunContext: WorkflowRunContext?
     ): DocumentLevelTriggerRunResult {
-        val triggerCtx = DocumentLevelTriggerExecutionContext(monitor, trigger)
+        val triggerCtx = DocumentLevelTriggerExecutionContext(monitor, trigger, clusterSettings = clusterService.clusterSettings)
         val triggerResult = triggerService.runDocLevelTrigger(monitor, trigger, queryToDocIds)
 
         val triggerFindingDocPairs = mutableListOf<Pair<String, String>>()

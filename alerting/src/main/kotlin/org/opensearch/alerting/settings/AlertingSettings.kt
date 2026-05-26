@@ -9,6 +9,7 @@ import org.opensearch.alerting.AlertingPlugin
 import org.opensearch.common.settings.Setting
 import org.opensearch.common.unit.TimeValue
 import java.util.concurrent.TimeUnit
+import java.util.function.Function
 
 /**
  * settings specific to [AlertingPlugin]. These settings include things like history index max age, request timeout, etc...
@@ -292,6 +293,22 @@ class AlertingSettings {
             3,
             0,
             Setting.Property.NodeScope, Setting.Property.Dynamic
+        )
+
+        val NOTIFICATION_CONTEXT_RESULTS_ALLOWED_ROLES: Setting<List<String>> = Setting.listSetting(
+            "plugins.alerting.notification_context_results_allowed_roles",
+            listOf(),
+            Function.identity(),
+            Setting.Property.NodeScope,
+            Setting.Property.Dynamic
+        )
+
+        val FILTER_BY_BACKEND_ROLES_ACCESS_STRATEGY = Setting.simpleString(
+            "plugins.alerting.filter_by_backend_roles_access_strategy",
+            FilterByBackendRolesAccessStrategy.INTERSECT.strategy,
+            FilterByBackendRolesAccessStrategyValidator(),
+            Setting.Property.NodeScope,
+            Setting.Property.Dynamic
         )
     }
 }

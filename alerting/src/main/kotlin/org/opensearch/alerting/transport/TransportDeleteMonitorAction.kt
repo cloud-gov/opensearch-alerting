@@ -11,13 +11,13 @@ import kotlinx.coroutines.launch
 import org.apache.logging.log4j.LogManager
 import org.opensearch.OpenSearchStatusException
 import org.opensearch.action.ActionRequest
-import org.opensearch.action.get.GetRequest
-import org.opensearch.action.get.GetResponse
 import org.opensearch.action.support.ActionFilters
 import org.opensearch.action.support.HandledTransportAction
 import org.opensearch.action.support.WriteRequest.RefreshPolicy
-import org.opensearch.alerting.opensearchapi.suspendUntil
+import org.opensearch.alerting.AlertingPlugin
 import org.opensearch.alerting.service.DeleteMonitorService
+import org.opensearch.alerting.service.ExternalSchedulerService
+import org.opensearch.alerting.service.SchedulerRoutingResolver
 import org.opensearch.alerting.settings.AlertingSettings
 import org.opensearch.cluster.service.ClusterService
 import org.opensearch.common.inject.Inject
@@ -32,10 +32,14 @@ import org.opensearch.commons.alerting.model.Monitor
 import org.opensearch.commons.alerting.model.ScheduledJob
 import org.opensearch.commons.alerting.util.AlertingException
 import org.opensearch.commons.authuser.User
+import org.opensearch.commons.utils.TenantContext
+import org.opensearch.commons.utils.currentTenantId
 import org.opensearch.commons.utils.recreateObject
 import org.opensearch.core.action.ActionListener
 import org.opensearch.core.rest.RestStatus
 import org.opensearch.core.xcontent.NamedXContentRegistry
+import org.opensearch.remote.metadata.client.GetDataObjectRequest
+import org.opensearch.remote.metadata.client.SdkClient
 import org.opensearch.tasks.Task
 import org.opensearch.transport.TransportService
 import org.opensearch.transport.client.Client
@@ -49,15 +53,29 @@ class TransportDeleteMonitorAction @Inject constructor(
     actionFilters: ActionFilters,
     val clusterService: ClusterService,
     settings: Settings,
-    val xContentRegistry: NamedXContentRegistry
+    val xContentRegistry: NamedXContentRegistry,
+    val sdkClient: SdkClient
 ) : HandledTransportAction<ActionRequest, DeleteMonitorResponse>(
     AlertingActions.DELETE_MONITOR_ACTION_NAME, transportService, actionFilters, ::DeleteMonitorRequest
 ),
     SecureTransportAction {
 
     @Volatile override var filterByEnabled = AlertingSettings.FILTER_BY_BACKEND_ROLES.get(settings)
+    @Volatile private var multiTenancyEnabled = AlertingSettings.MULTI_TENANCY_ENABLED.get(settings)
+    @Volatile private var externalSchedulerEnabled = AlertingSettings.EXTERNAL_SCHEDULER_ENABLED.get(settings)
+    @Volatile private var externalSchedulerAccountId = AlertingSettings.EXTERNAL_SCHEDULER_ACCOUNT_ID.get(settings)
+    @Volatile private var externalSchedulerRoleName = AlertingSettings.EXTERNAL_SCHEDULER_ROLE_NAME.get(settings)
 
     init {
+        clusterService.clusterSettings.addSettingsUpdateConsumer(AlertingSettings.EXTERNAL_SCHEDULER_ENABLED) {
+            externalSchedulerEnabled = it
+        }
+        clusterService.clusterSettings.addSettingsUpdateConsumer(AlertingSettings.EXTERNAL_SCHEDULER_ACCOUNT_ID) {
+            externalSchedulerAccountId = it
+        }
+        clusterService.clusterSettings.addSettingsUpdateConsumer(AlertingSettings.EXTERNAL_SCHEDULER_ROLE_NAME) {
+            externalSchedulerRoleName = it
+        }
         listenFilterBySettingChange(clusterService)
     }
 
@@ -69,7 +87,8 @@ class TransportDeleteMonitorAction @Inject constructor(
         if (!validateUserBackendRoles(user, actionListener)) {
             return
         }
-        scope.launch {
+        val tenantId = client.threadPool().threadContext.getHeader(AlertingPlugin.TENANT_ID_HEADER)
+        scope.launch(TenantContext(tenantId)) {
             DeleteMonitorHandler(
                 client,
                 actionListener,
@@ -92,7 +111,7 @@ class TransportDeleteMonitorAction @Inject constructor(
                 val canDelete = user == null || !doFilterForUser(user) ||
                     checkUserPermissionsWithResource(user, monitor.user, actionListener, "monitor", monitorId)
 
-                if (DeleteMonitorService.monitorIsWorkflowDelegate(monitor.id)) {
+                if (!multiTenancyEnabled && DeleteMonitorService.monitorIsWorkflowDelegate(monitor.id)) {
                     actionListener.onFailure(
                         AlertingException(
                             "Monitor can't be deleted because it is a part of workflow(s)",
@@ -100,37 +119,80 @@ class TransportDeleteMonitorAction @Inject constructor(
                             IllegalStateException()
                         )
                     )
+                    return
                 } else if (canDelete) {
-                    actionListener.onResponse(
-                        DeleteMonitorService.deleteMonitor(monitor, refreshPolicy)
-                    )
+                    // Delete EB schedule FIRST — if this fails, the monitor record is
+                    // preserved so the schedule can be retried. Deleting the monitor
+                    // first would orphan the EB schedule with no record to reconcile.
+                    if (externalSchedulerEnabled) {
+                        deleteExternalSchedule(monitor)
+                    }
+
+                    val response = DeleteMonitorService.deleteMonitor(monitor, refreshPolicy)
+                    val schedulerAccountId = monitor.metadata
+                        ?.get(ExternalSchedulerService.SCHEDULE_ARN_METADATA_KEY)
+                        ?.let { ExternalSchedulerService.parseScheduleArn(it).accountId }
+                    if (schedulerAccountId != null) {
+                        client.threadPool().threadContext
+                            .putTransient(ExternalSchedulerService.SCHEDULER_ACCOUNT_ID_KEY, schedulerAccountId)
+                    }
+                    actionListener.onResponse(response)
                 } else {
                     actionListener.onFailure(
                         AlertingException("Not allowed to delete this monitor!", RestStatus.FORBIDDEN, IllegalStateException())
                     )
                 }
+            } catch (t: OpenSearchStatusException) {
+                log.error("Failed to delete monitor $monitorId", t)
+                actionListener.onFailure(t)
             } catch (t: Exception) {
                 log.error("Failed to delete monitor $monitorId", t)
                 actionListener.onFailure(AlertingException.wrap(t))
             }
         }
 
-        private suspend fun getMonitor(): Monitor {
-            val getRequest = GetRequest(ScheduledJob.SCHEDULED_JOBS_INDEX, monitorId)
-
-            val getResponse: GetResponse = client.suspendUntil { get(getRequest, it) }
-            if (getResponse.isExists == false) {
-                actionListener.onFailure(
-                    AlertingException.wrap(
-                        OpenSearchStatusException("Monitor with $monitorId is not found", RestStatus.NOT_FOUND)
-                    )
-                )
+        /**
+         * Deletes the external schedule before deleting the monitor.
+         * Fails the request if cleanup cannot complete — preserving the monitor
+         * record so the schedule deletion can be retried.
+         */
+        private fun deleteExternalSchedule(monitor: Monitor) {
+            val scheduleArn = monitor.metadata?.get(ExternalSchedulerService.SCHEDULE_ARN_METADATA_KEY)
+            val accountIdOverride = scheduleArn?.let {
+                ExternalSchedulerService.parseScheduleArn(it).accountId
             }
-            val xcp = XContentHelper.createParser(
-                xContentRegistry, LoggingDeprecationHandler.INSTANCE,
-                getResponse.sourceAsBytesRef, XContentType.JSON
+            val routing = SchedulerRoutingResolver.resolveForDelete(
+                settingsAccountId = externalSchedulerAccountId,
+                settingsRoleName = externalSchedulerRoleName,
+                threadContextAccountIdOverride = accountIdOverride
             )
-            return ScheduledJob.parse(xcp, getResponse.id, getResponse.version) as Monitor
+            ExternalSchedulerService.deleteSchedule(monitor.id, routing)
+        }
+
+        private suspend fun getMonitor(): Monitor {
+            val tenantId = currentTenantId()
+            val getRequest = GetDataObjectRequest.builder()
+                .index(ScheduledJob.SCHEDULED_JOBS_INDEX)
+                .id(monitorId)
+                .tenantId(tenantId)
+                .build()
+
+            try {
+                val response = sdkClient.getDataObject(getRequest)
+                val getResponse = response.getResponse()
+                if (getResponse == null || !getResponse.isExists) {
+                    throw OpenSearchStatusException("Monitor with $monitorId is not found", RestStatus.NOT_FOUND)
+                }
+                val xcp = XContentHelper.createParser(
+                    xContentRegistry, LoggingDeprecationHandler.INSTANCE,
+                    getResponse.sourceAsBytesRef, XContentType.JSON
+                )
+                return ScheduledJob.parse(xcp, getResponse.id, getResponse.version) as Monitor
+            } catch (e: Exception) {
+                if (e is OpenSearchStatusException && e.status() == RestStatus.NOT_FOUND) throw e
+                log.error("GetMonitor operation failed for $monitorId", e)
+                throw OpenSearchStatusException("Monitor with $monitorId is not found", RestStatus.NOT_FOUND)
+            }
         }
     }
 }

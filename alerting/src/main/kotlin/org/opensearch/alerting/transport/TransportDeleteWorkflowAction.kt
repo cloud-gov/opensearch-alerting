@@ -23,6 +23,7 @@ import org.opensearch.action.search.SearchResponse
 import org.opensearch.action.support.ActionFilters
 import org.opensearch.action.support.HandledTransportAction
 import org.opensearch.action.support.WriteRequest.RefreshPolicy
+import org.opensearch.alerting.AlertingPlugin
 import org.opensearch.alerting.core.lock.LockModel
 import org.opensearch.alerting.core.lock.LockService
 import org.opensearch.alerting.opensearchapi.addFilter
@@ -48,6 +49,7 @@ import org.opensearch.commons.alerting.model.Workflow
 import org.opensearch.commons.alerting.model.WorkflowMetadata
 import org.opensearch.commons.alerting.util.AlertingException
 import org.opensearch.commons.authuser.User
+import org.opensearch.commons.utils.TenantContext
 import org.opensearch.commons.utils.recreateObject
 import org.opensearch.core.action.ActionListener
 import org.opensearch.core.rest.RestStatus
@@ -84,11 +86,25 @@ class TransportDeleteWorkflowAction @Inject constructor(
 
     @Volatile override var filterByEnabled = AlertingSettings.FILTER_BY_BACKEND_ROLES.get(settings)
 
+    private val multiTenancyEnabled = AlertingSettings.MULTI_TENANCY_ENABLED.get(settings)
+
     init {
         listenFilterBySettingChange(clusterService)
     }
 
     override fun doExecute(task: Task, request: ActionRequest, actionListener: ActionListener<DeleteWorkflowResponse>) {
+        if (multiTenancyEnabled) {
+            actionListener.onFailure(
+                AlertingException.wrap(
+                    OpenSearchStatusException(
+                        "Workflow operations are not allowed when multi-tenancy is enabled.",
+                        RestStatus.METHOD_NOT_ALLOWED
+                    )
+                )
+            )
+            return
+        }
+
         val transformedRequest = request as? DeleteWorkflowRequest
             ?: recreateObject(request) { DeleteWorkflowRequest(it) }
 
@@ -100,7 +116,8 @@ class TransportDeleteWorkflowAction @Inject constructor(
             return
         }
 
-        scope.launch {
+        val tenantId = client.threadPool().threadContext.getHeader(AlertingPlugin.TENANT_ID_HEADER)
+        scope.launch(TenantContext(tenantId)) {
             DeleteWorkflowHandler(
                 client,
                 actionListener,

@@ -7,7 +7,7 @@ buildscript {
     apply from: 'build-tools/repositories.gradle'
 
     ext {
-        opensearch_version = System.getProperty("opensearch.version", "3.3.0-SNAPSHOT")
+        opensearch_version = System.getProperty("opensearch.version", "3.7.0-SNAPSHOT")
         buildVersionQualifier = System.getProperty("build.version_qualifier", "")
         isSnapshot = "true" == System.getProperty("build.snapshot", "true")
         // 3.0.0-SNAPSHOT -> 3.0.0.0-SNAPSHOT
@@ -22,18 +22,20 @@ buildscript {
             opensearch_build += "-SNAPSHOT"
         }
         opensearch_no_snapshot = opensearch_version.replace("-SNAPSHOT","")
-        common_utils_version = System.getProperty("common_utils.version", opensearch_build)
-        kotlin_version = '1.9.25'
+        // TODO: revert to opensearch_build after alerting version bump to 3.7.0
+        common_utils_version = System.getProperty("common_utils.version", "3.7.0.0-SNAPSHOT")
+        kotlin_version = '2.2.0'
     }
 
     repositories {
         mavenLocal()
-        maven { 
-            url "https://central.sonatype.com/repository/maven-snapshots/"
+        maven {
+            url "https://ci.opensearch.org/ci/dbc/snapshots/maven/"
             mavenContent {
                 snapshotsOnly()
             }
         }
+        maven { url "https://ci.opensearch.org/maven2/" }
         mavenCentral()
         maven { url "https://plugins.gradle.org/m2/" }
     }
@@ -55,13 +57,29 @@ apply plugin: 'jacoco'
 apply plugin: 'opensearch.java-agent'
 apply from: 'build-tools/merged-coverage.gradle'
 
+// Add explicit repository configuration for ktlint
+repositories {
+    maven { url "https://ci.opensearch.org/maven2/" }
+    mavenCentral()
+}
+
+// Configure ktlint with explicit repository
 configurations {
     ktlint {
-      resolutionStrategy {
-          force "ch.qos.logback:logback-classic:1.5.16"
-          force "ch.qos.logback:logback-core:1.5.16"
-      }
-   }
+        resolutionStrategy {
+            force "ch.qos.logback:logback-classic:1.5.19"
+            force "ch.qos.logback:logback-core:1.5.19"
+        }
+    }
+}
+
+// Add repository ONLY for ktlint resolution
+configurations.ktlint.incoming.beforeResolve {
+    repositories.clear()
+    repositories {
+        maven { url "https://ci.opensearch.org/maven2/" }
+        mavenCentral()
+    }
 }
 
 dependencies {
@@ -74,16 +92,26 @@ dependencies {
 
 task ktlint(type: JavaExec, group: "verification") {
     description = "Check Kotlin code style."
-    main = "com.pinterest.ktlint.Main"
+    mainClass = "com.pinterest.ktlint.Main"
     classpath = configurations.ktlint
     args "alerting/**/*.kt", "elastic-api/**/*.kt", "core/**/*.kt"
+    
+    // Skip on JDK 25
+    onlyIf {
+        JavaVersion.current() < JavaVersion.VERSION_25
+    }
 }
 
 task ktlintFormat(type: JavaExec, group: "formatting") {
     description = "Fix Kotlin code style deviations."
-    main = "com.pinterest.ktlint.Main"
+    mainClass = "com.pinterest.ktlint.Main"
     classpath = configurations.ktlint
     args "-F", "alerting/**/*.kt", "elastic-api/**/*.kt", "core/**/*.kt"
+    
+    // Skip on JDK 25 until ktlint fully supports it
+    onlyIf {
+        JavaVersion.current() < JavaVersion.VERSION_25
+    }
 }
 
 check.dependsOn ktlint
@@ -93,6 +121,19 @@ allprojects {
     version = "${opensearch_build}"
 
     apply from: "$rootDir/build-tools/repositories.gradle"
+
+    configurations.all {
+        resolutionStrategy {
+            force "org.jetbrains.kotlin:kotlin-stdlib:${kotlin_version}"
+            force "org.jetbrains.kotlin:kotlin-stdlib-common:${kotlin_version}"
+            force "org.jetbrains.kotlin:kotlin-stdlib-jdk8:${kotlin_version}"
+            force "org.jetbrains.kotlin:kotlin-stdlib-jdk7:${kotlin_version}"
+            force "org.jetbrains.kotlin:kotlin-reflect:${kotlin_version}"
+            force "org.apache.logging.log4j:log4j-api:2.25.4"
+            force "org.apache.logging.log4j:log4j-core:2.25.4"
+            force "org.apache.httpcomponents.client5:httpclient5:5.6.1"
+        }
+    }
 
     tasks.withType(JavaCompile) {
         sourceCompatibility = JavaVersion.VERSION_21

@@ -11,10 +11,14 @@ import org.apache.hc.core5.http.message.BasicHeader
 import org.opensearch.alerting.ALERTING_BASE_URI
 import org.opensearch.alerting.ALWAYS_RUN
 import org.opensearch.alerting.ANOMALY_DETECTOR_INDEX
+import org.opensearch.alerting.AlertingPlugin.Companion.MONITOR_BASE_URI
 import org.opensearch.alerting.AlertingRestTestCase
 import org.opensearch.alerting.LEGACY_OPENDISTRO_ALERTING_BASE_URI
+import org.opensearch.alerting.TEST_INDEX_MAPPINGS
+import org.opensearch.alerting.TEST_INDEX_NAME
 import org.opensearch.alerting.alerts.AlertIndices
 import org.opensearch.alerting.anomalyDetectorIndexMapping
+import org.opensearch.alerting.assertPplMonitorsEqual
 import org.opensearch.alerting.core.settings.ScheduledJobSettings
 import org.opensearch.alerting.makeRequest
 import org.opensearch.alerting.model.destination.Chime
@@ -30,15 +34,25 @@ import org.opensearch.alerting.randomDocLevelMonitorInput
 import org.opensearch.alerting.randomDocLevelQuery
 import org.opensearch.alerting.randomDocumentLevelMonitor
 import org.opensearch.alerting.randomDocumentLevelTrigger
+import org.opensearch.alerting.randomPPLMonitor
+import org.opensearch.alerting.randomPPLTrigger
 import org.opensearch.alerting.randomQueryLevelMonitor
 import org.opensearch.alerting.randomQueryLevelTrigger
+import org.opensearch.alerting.randomTemplateScript
 import org.opensearch.alerting.randomThrottle
 import org.opensearch.alerting.randomUser
 import org.opensearch.alerting.settings.AlertingSettings
+import org.opensearch.alerting.settings.AlertingSettings.Companion.ALERTING_MAX_MONITORS
+import org.opensearch.alerting.settings.AlertingSettings.Companion.MAX_PPL_TRIGGERS_PER_MONITOR
+import org.opensearch.alerting.settings.AlertingSettings.Companion.NOTIFICATION_MESSAGE_SOURCE_MAX_LENGTH
+import org.opensearch.alerting.settings.AlertingSettings.Companion.NOTIFICATION_SUBJECT_SOURCE_MAX_LENGTH
+import org.opensearch.alerting.settings.AlertingSettings.Companion.PPL_MAX_QUERY_LENGTH
 import org.opensearch.alerting.toJsonString
 import org.opensearch.alerting.util.DestinationType
 import org.opensearch.client.ResponseException
 import org.opensearch.client.WarningFailureException
+import org.opensearch.common.UUIDs
+import org.opensearch.common.settings.Settings
 import org.opensearch.common.unit.TimeValue
 import org.opensearch.common.xcontent.XContentType
 import org.opensearch.commons.alerting.model.Alert
@@ -47,6 +61,8 @@ import org.opensearch.commons.alerting.model.DocLevelMonitorInput
 import org.opensearch.commons.alerting.model.DocLevelQuery
 import org.opensearch.commons.alerting.model.DocumentLevelTrigger
 import org.opensearch.commons.alerting.model.Monitor
+import org.opensearch.commons.alerting.model.PPLTrigger
+import org.opensearch.commons.alerting.model.PPLTrigger.ConditionType
 import org.opensearch.commons.alerting.model.QueryLevelTrigger
 import org.opensearch.commons.alerting.model.ScheduledJob
 import org.opensearch.commons.alerting.model.SearchInput
@@ -55,6 +71,8 @@ import org.opensearch.core.common.bytes.BytesReference
 import org.opensearch.core.rest.RestStatus
 import org.opensearch.core.xcontent.ToXContent
 import org.opensearch.core.xcontent.XContentBuilder
+import org.opensearch.core.xcontent.XContentParser
+import org.opensearch.core.xcontent.XContentParserUtils
 import org.opensearch.index.query.QueryBuilders
 import org.opensearch.script.Script
 import org.opensearch.search.aggregations.AggregationBuilders
@@ -72,7 +90,9 @@ import java.util.concurrent.TimeUnit
 @Suppress("UNCHECKED_CAST")
 class MonitorRestApiIT : AlertingRestTestCase() {
 
-    val USE_TYPED_KEYS = ToXContent.MapParams(mapOf("with_type" to "true"))
+    companion object {
+        val USE_TYPED_KEYS = ToXContent.MapParams(mapOf("with_type" to "true"))
+    }
 
     @Throws(Exception::class)
     fun `test plugin is loaded`() {
@@ -1534,19 +1554,6 @@ class MonitorRestApiIT : AlertingRestTestCase() {
         assertEquals("More than $numberOfNodes successful node", numberOfNodes, nodesResponse["successful"])
     }
 
-    private fun isMonitorScheduled(monitorId: String, alertingStatsResponse: Map<String, Any>): Boolean {
-        val nodesInfo = alertingStatsResponse["nodes"] as Map<String, Any>
-        for (nodeId in nodesInfo.keys) {
-            val nodeInfo = nodesInfo[nodeId] as Map<String, Any>
-            val jobsInfo = nodeInfo["jobs_info"] as Map<String, Any>
-            if (jobsInfo.keys.contains(monitorId)) {
-                return true
-            }
-        }
-
-        return false
-    }
-
     private fun assertAlertingStatsSweeperEnabled(alertingStatsResponse: Map<String, Any>, expected: Boolean) {
         assertEquals(
             "Legacy scheduled job enabled field is not set to $expected",
@@ -1558,5 +1565,485 @@ class MonitorRestApiIT : AlertingRestTestCase() {
             expected,
             alertingStatsResponse[statsResponseOpenSearchSweeperEnabledField]
         )
+    }
+
+    fun `test sweeper works with id field data disabled`() {
+        client().updateSettings(ScheduledJobSettings.SWEEPER_ENABLED.key, true)
+        val monitor = createRandomMonitor(refresh = true)
+        // Disable _id fielddata — this previously broke the sweeper
+        client().updateSettings("indices.id_field_data.enabled", false)
+        try {
+            val monitor2 = createRandomMonitor(refresh = true)
+            assertNotNull("Monitor was not created", monitor2.id)
+            val executeResponse = executeMonitor(monitor2.id)
+            assertEquals("Execute monitor failed", RestStatus.OK, executeResponse.restStatus())
+        } finally {
+            client().updateSettings("indices.id_field_data.enabled", true)
+        }
+    }
+
+    fun `test sweeper works after all monitors deleted`() {
+        client().updateSettings(ScheduledJobSettings.SWEEPER_ENABLED.key, true)
+        val monitor = createRandomMonitor(refresh = true)
+        client().makeRequest("DELETE", "$ALERTING_BASE_URI/${monitor.id}")
+        refreshIndex(ScheduledJob.SCHEDULED_JOBS_INDEX)
+        // Create a new monitor after index was emptied — sweeper should handle this
+        val monitor2 = createRandomMonitor(refresh = true)
+        assertNotNull("Monitor was not created", monitor2.id)
+        val executeResponse = executeMonitor(monitor2.id)
+        assertEquals("Execute monitor failed", RestStatus.OK, executeResponse.restStatus())
+    }
+
+    fun `test existing monitor with triggers over new limit still executes`() {
+        // Create monitor with 10 triggers at default limit
+        val triggers = (1..10).map {
+            randomQueryLevelTrigger(name = "trigger-$it", condition = Script("return true"))
+        }
+        val monitor = createMonitor(randomQueryLevelMonitor(triggers = triggers, enabled = true))
+        assertEquals("Monitor should have 10 triggers", 10, monitor.triggers.size)
+
+        // Execute monitor — should succeed
+        val executeResponse = executeMonitor(monitor.id)
+        assertEquals("Execute monitor failed", RestStatus.OK, executeResponse.restStatus())
+
+        // Lower the limit to 5
+        client().updateSettings("plugins.alerting.monitor.max_triggers", 5)
+
+        // Execute the existing monitor again — should still succeed
+        val executeResponse2 = executeMonitor(monitor.id)
+        assertEquals("Existing monitor should still execute after lowering limit", RestStatus.OK, executeResponse2.restStatus())
+
+        // Reset setting
+        client().updateSettings("plugins.alerting.monitor.max_triggers", 10)
+    }
+
+    fun `test new monitor rejected when over trigger limit`() {
+        client().updateSettings("plugins.alerting.monitor.max_triggers", 5)
+        try {
+            val triggers = (1..6).map {
+                randomQueryLevelTrigger(name = "trigger-$it", condition = Script("return true"))
+            }
+            try {
+                createMonitor(randomQueryLevelMonitor(triggers = triggers))
+                fail("Expected monitor creation to fail")
+            } catch (e: ResponseException) {
+                assertEquals("Should be bad request", RestStatus.BAD_REQUEST.status, e.response.statusLine.statusCode)
+            }
+        } finally {
+            client().updateSettings("plugins.alerting.monitor.max_triggers", 10)
+        }
+    }
+
+    @Suppress("UNCHECKED_CAST")
+    fun `test metadata field is not exposed in get monitor response`() {
+        // Create a monitor with metadata using toXContentWithUser (secure=false) so metadata is persisted
+        val monitor = randomQueryLevelMonitor().copy(
+            metadata = mapOf("appId" to "test-app", "workspaceId" to "ws-123")
+        )
+        val createResponse = client().makeRequest(
+            "POST", "$ALERTING_BASE_URI?refresh=true", emptyMap(),
+            monitor.toHttpEntityWithUser()
+        )
+        assertEquals("Create monitor failed", RestStatus.CREATED, createResponse.restStatus())
+        val createMap = createParser(XContentType.JSON.xContent(), createResponse.entity.content).map()
+        val monitorId = createMap["_id"] as String
+        val createMonitorMap = createMap["monitor"] as Map<String, Any>
+        assertFalse("Metadata should not be in create response", createMonitorMap.containsKey("metadata"))
+
+        // GET monitor — metadata should not be exposed
+        val getResponse = client().makeRequest("GET", "$ALERTING_BASE_URI/$monitorId", emptyMap())
+        assertEquals("Get monitor failed", RestStatus.OK, getResponse.restStatus())
+        val getMap = createParser(XContentType.JSON.xContent(), getResponse.entity.content).map()
+        val getMonitorMap = getMap["monitor"] as Map<String, Any>
+        assertFalse("Metadata should not be in get response", getMonitorMap.containsKey("metadata"))
+
+        // Search monitor — metadata should not be exposed
+        val search = SearchSourceBuilder().query(QueryBuilders.termQuery("_id", monitorId)).toString()
+        val searchResponse = client().makeRequest(
+            "GET", "$ALERTING_BASE_URI/_search", emptyMap(),
+            StringEntity(search, ContentType.APPLICATION_JSON)
+        )
+        assertEquals("Search monitor failed", RestStatus.OK, searchResponse.restStatus())
+        val searchMap = createParser(XContentType.JSON.xContent(), searchResponse.entity.content).map()
+        val hits = searchMap["hits"] as Map<String, Any>
+        val hitsList = hits["hits"] as List<Map<String, Any>>
+        assertFalse("Search should return results", hitsList.isEmpty())
+        val source = hitsList[0]["_source"] as Map<String, Any>
+        assertFalse("Metadata should not be in search response", source.containsKey("metadata"))
+    }
+
+    /* PPL Monitor Simple Case Tests */
+    fun `test create ppl monitor`() {
+        createIndex(TEST_INDEX_NAME, Settings.EMPTY, TEST_INDEX_MAPPINGS)
+        val pplMonitor = randomPPLMonitor()
+
+        val response = client().makeRequest("POST", MONITOR_BASE_URI, emptyMap(), pplMonitor.toHttpEntity())
+        assertEquals("Unable to create a new monitor v2", RestStatus.CREATED, response.restStatus())
+
+        val responseBody = response.asMap()
+        val createdId = responseBody["_id"] as String
+        val createdVersion = responseBody["_version"] as Int
+        assertNotEquals("response is missing Id", Monitor.NO_ID, createdId)
+        assertEquals("incorrect version", 1, createdVersion)
+    }
+
+    fun `test update ppl monitor`() {
+        val originalMonitor = createRandomPPLMonitor()
+
+        val newMonitorConfig = randomPPLMonitor()
+
+        val updateResponse = client().makeRequest(
+            "PUT",
+            "$MONITOR_BASE_URI/${originalMonitor.id}",
+            emptyMap(), newMonitorConfig.toHttpEntity()
+        )
+
+        assertEquals("Update monitor failed", RestStatus.OK, updateResponse.restStatus())
+        val responseBody = updateResponse.asMap()
+        assertEquals("Updated monitor id doesn't match", originalMonitor.id, responseBody["_id"] as String)
+        assertEquals("Version not incremented", (originalMonitor.version + 1).toInt(), responseBody["_version"] as Int)
+
+        val updatedMonitor = getMonitor(originalMonitor.id)
+        assertPplMonitorsEqual(newMonitorConfig, updatedMonitor)
+    }
+
+    fun `test get ppl monitor`() {
+        // first create the monitor
+        createIndex(TEST_INDEX_NAME, Settings.EMPTY, TEST_INDEX_MAPPINGS)
+        val pplMonitor = randomPPLMonitor()
+
+        val createResponse = client().makeRequest("POST", MONITOR_BASE_URI, emptyMap(), pplMonitor.toHttpEntity())
+        assertEquals("Unable to create a new monitor v2", RestStatus.CREATED, createResponse.restStatus())
+
+        val responseBody = createResponse.asMap()
+        val pplMonitorId = responseBody["_id"] as String
+        val pplMonitorVersion = (responseBody["_version"] as Int).toLong()
+
+        // then attempt to get it
+        val response = client().makeRequest("GET", "$MONITOR_BASE_URI/$pplMonitorId")
+        assertEquals("Unable to get monitorV2 $pplMonitorId", RestStatus.OK, response.restStatus())
+
+        val parser = createParser(XContentType.JSON.xContent(), response.entity.content)
+        XContentParserUtils.ensureExpectedToken(XContentParser.Token.START_OBJECT, parser.nextToken(), parser)
+
+        lateinit var id: String
+        var version: Long = 0
+        lateinit var storedPplMonitor: Monitor
+
+        while (parser.nextToken() != XContentParser.Token.END_OBJECT) {
+            parser.nextToken()
+
+            when (parser.currentName()) {
+                "_id" -> id = parser.text()
+                "_version" -> version = parser.longValue()
+                "monitor" -> storedPplMonitor = Monitor.parse(parser)
+                "associated_workflows" -> {
+                    XContentParserUtils.ensureExpectedToken(
+                        XContentParser.Token.START_ARRAY,
+                        parser.currentToken(),
+                        parser
+                    )
+                    while (parser.nextToken() != XContentParser.Token.END_ARRAY) {
+                        // do nothing
+                    }
+                }
+            }
+        }
+
+        assertEquals(
+            "Monitor V2 ID from Get Monitor doesn't match one from Create Monitor response",
+            pplMonitorId, id
+        )
+        assertEquals(
+            "Monitor V2 version from Get Monitor doesn't match one from Create Monitor response",
+            pplMonitorVersion, version
+        )
+        assertPplMonitorsEqual(pplMonitor, storedPplMonitor)
+    }
+
+    fun `test head ppl monitor`() {
+        val submittedPplMonitor = createRandomPPLMonitor()
+        val response = client().makeRequest("HEAD", "$MONITOR_BASE_URI/${submittedPplMonitor.id}")
+        assertEquals("Unable to get monitorV2 ${submittedPplMonitor.id}", RestStatus.OK, response.restStatus())
+    }
+
+    fun `test search ppl monitor with GET and match_all`() {
+        createRandomPPLMonitor()
+
+        val search = SearchSourceBuilder().query(QueryBuilders.matchAllQuery()).toString()
+        val searchResponse = client().makeRequest(
+            "GET", "$MONITOR_BASE_URI/_search",
+            emptyMap(), StringEntity(search, ContentType.APPLICATION_JSON)
+        )
+
+        assertEquals("Search monitor failed", RestStatus.OK, searchResponse.restStatus())
+        val xcp = createParser(XContentType.JSON.xContent(), searchResponse.entity.content)
+        val hits = xcp.map()["hits"]!! as Map<String, Map<String, Any>>
+        val numberDocsFound = hits["total"]?.get("value")
+        assertEquals("PPL Monitor not found during search", 1, numberDocsFound)
+    }
+
+    fun `test search ppl monitor with POST and term query on ID`() {
+        val pplMonitor = createRandomPPLMonitor()
+
+        val search = SearchSourceBuilder().query(QueryBuilders.termQuery("_id", pplMonitor.id)).toString()
+        val searchResponse = client().makeRequest(
+            "POST", "$MONITOR_BASE_URI/_search",
+            emptyMap(), StringEntity(search, ContentType.APPLICATION_JSON)
+        )
+
+        assertEquals("Search monitor failed", RestStatus.OK, searchResponse.restStatus())
+        val xcp = createParser(XContentType.JSON.xContent(), searchResponse.entity.content)
+        val hits = xcp.map()["hits"]!! as Map<String, Map<String, Any>>
+        val numberDocsFound = hits["total"]?.get("value")
+        assertEquals("PPL Monitor not found during search", 1, numberDocsFound)
+    }
+
+    fun `test delete ppl monitor`() {
+        val pplMonitor = createRandomPPLMonitor()
+
+        val deleteResponse = client().makeRequest("DELETE", "$MONITOR_BASE_URI/${pplMonitor.id}")
+        assertEquals("Delete failed", RestStatus.OK, deleteResponse.restStatus())
+
+        val getResponse = client().makeRequest("HEAD", "$MONITOR_BASE_URI/${pplMonitor.id}")
+        assertEquals("Deleted monitor still exists", RestStatus.NOT_FOUND, getResponse.restStatus())
+    }
+
+    fun `test parsing ppl monitor as a scheduled job`() {
+        val monitorV2 = createRandomPPLMonitor()
+
+        val builder = monitorV2.toXContentWithUser(XContentBuilder.builder(XContentType.JSON.xContent()), USE_TYPED_KEYS)
+        val string = BytesReference.bytes(builder).utf8ToString()
+        val xcp = createParser(XContentType.JSON.xContent(), string)
+        val scheduledJob = ScheduledJob.parse(xcp, monitorV2.id, monitorV2.version)
+        assertEquals(monitorV2, scheduledJob)
+    }
+
+    /* PPL Monitor Validation Tests */
+    fun `test create ppl monitor that queries nonexistent index fails`() {
+        val pplMonitorConfig = randomPPLMonitor(
+            query = "source = nonexistent_index | head 10"
+        )
+
+        // ensure the request fails
+        try {
+            createRandomPPLMonitor(pplMonitorConfig)
+            fail("Expected request to fail with BAD_REQUEST but it succeeded")
+        } catch (e: ResponseException) {
+            assertEquals("Unexpected status", RestStatus.BAD_REQUEST, e.response.restStatus())
+        }
+
+        // ensure no monitor was created
+        ensureNumMonitors(0)
+    }
+
+    fun `test create ppl monitor with more than max allowed monitors fails`() {
+        adminClient().updateSettings(ALERTING_MAX_MONITORS.key, 1)
+
+        createRandomPPLMonitor()
+
+        // ensure the request fails
+        try {
+            createRandomPPLMonitor()
+            fail("Expected request to fail with BAD_REQUEST but it succeeded")
+        } catch (e: ResponseException) {
+            assertEquals("Unexpected status", RestStatus.BAD_REQUEST, e.response.restStatus())
+        }
+
+        // ensure no monitor was created
+        ensureNumMonitors(1)
+    }
+
+    fun `test create ppl monitor with invalid query fails`() {
+        // ensure the request fails
+        try {
+            createRandomPPLMonitor(
+                randomPPLMonitor(
+                    query = "source = $TEST_INDEX_NAME | not valid ppl"
+                )
+            )
+            fail("Expected request to fail with BAD_REQUEST but it succeeded")
+        } catch (e: ResponseException) {
+            assertEquals("Unexpected status", RestStatus.BAD_REQUEST, e.response.restStatus())
+        }
+
+        // ensure no monitor was created
+        ensureNumMonitors(0)
+    }
+
+    fun `test create ppl monitor with query that's too long fails`() {
+        adminClient().updateSettings(PPL_MAX_QUERY_LENGTH.key, 1)
+
+        // ensure the request fails
+        try {
+            createRandomPPLMonitor(
+                randomPPLMonitor(
+                    query = "source = $TEST_INDEX_NAME | head 10"
+                )
+            )
+            fail("Expected request to fail with BAD_REQUEST but it succeeded")
+        } catch (e: ResponseException) {
+            assertEquals("Unexpected status", RestStatus.BAD_REQUEST, e.response.restStatus())
+        }
+
+        // ensure no monitor was created
+        ensureNumMonitors(0)
+    }
+
+    fun `test create ppl monitor with invalid custom condition fails`() {
+        // ensure the request fails
+        try {
+            createRandomPPLMonitor(
+                randomPPLMonitor(
+                    triggers = listOf(
+                        randomPPLTrigger(
+                            conditionType = ConditionType.CUSTOM,
+                            customCondition = "eval result = 3 > 1",
+                            numResultsCondition = null,
+                            numResultsValue = null
+                        )
+                    ),
+                    query = "source = $TEST_INDEX_NAME | head 10"
+                )
+            )
+            fail("Expected request to fail with BAD_REQUEST but it succeeded")
+        } catch (e: ResponseException) {
+            assertEquals("Unexpected status", RestStatus.BAD_REQUEST, e.response.restStatus())
+        }
+
+        // ensure no monitor was created
+        ensureNumMonitors(0)
+    }
+
+    fun `test create ppl monitor with notification subject source too long fails`() {
+        adminClient().updateSettings(NOTIFICATION_SUBJECT_SOURCE_MAX_LENGTH.key, 100)
+
+        var subjectTooLong = ""
+        for (i in 0 until 101) {
+            subjectTooLong += "a"
+        }
+
+        // ensure the request fails
+        try {
+            createRandomPPLMonitor(
+                randomPPLMonitor(
+                    triggers = listOf(
+                        randomPPLTrigger(
+                            actions = listOf(
+                                randomAction(
+                                    template = randomTemplateScript(
+                                        source = "some message"
+                                    ),
+                                    subjectTemplate = randomTemplateScript(
+                                        source = subjectTooLong
+                                    )
+                                )
+                            )
+                        )
+                    )
+                )
+            )
+            fail("Expected request to fail with BAD_REQUEST but it succeeded")
+        } catch (e: ResponseException) {
+            assertEquals("Unexpected status", RestStatus.BAD_REQUEST, e.response.restStatus())
+        }
+
+        // ensure no monitor was created
+        ensureNumMonitors(0)
+    }
+
+    fun `test create ppl monitor with notification message source too long fails`() {
+        adminClient().updateSettings(NOTIFICATION_MESSAGE_SOURCE_MAX_LENGTH.key, 1000)
+
+        var messageTooLong = ""
+        for (i in 0 until 1001) {
+            messageTooLong += "a"
+        }
+
+        // ensure the request fails
+        try {
+            createRandomPPLMonitor(
+                randomPPLMonitor(
+                    triggers = listOf(
+                        randomPPLTrigger(
+                            actions = listOf(
+                                randomAction(
+                                    template = randomTemplateScript(
+                                        source = messageTooLong
+                                    ),
+                                    subjectTemplate = randomTemplateScript(
+                                        source = "some subject"
+                                    )
+                                )
+                            )
+                        )
+                    )
+                )
+            )
+            fail("Expected request to fail with BAD_REQUEST but it succeeded")
+        } catch (e: ResponseException) {
+            assertEquals("Unexpected status", RestStatus.BAD_REQUEST, e.response.restStatus())
+        }
+
+        // ensure no monitor was created
+        ensureNumMonitors(0)
+    }
+
+    fun `test update nonexistent ppl monitor fails`() {
+        // the random monitor query searches index TEST_INDEX_NAME,
+        // so we need to create that first to ensure at least the request body is valid
+        createIndex(TEST_INDEX_NAME, Settings.EMPTY, TEST_INDEX_MAPPINGS)
+
+        val monitorV2 = randomPPLMonitor()
+        val randomId = UUIDs.base64UUID()
+
+        try {
+            client().makeRequest("PUT", "$MONITOR_BASE_URI/$randomId", emptyMap(), monitorV2.toHttpEntity())
+            fail("Expected request to fail with NOT_FOUND but it succeeded")
+        } catch (e: ResponseException) {
+            assertEquals("Unexpected status", RestStatus.NOT_FOUND, e.response.restStatus())
+        }
+    }
+
+    fun `test delete nonexistent ppl monitor fails`() {
+        val randomId = UUIDs.base64UUID()
+
+        try {
+            client().makeRequest("DELETE", "$MONITOR_BASE_URI/$randomId")
+            fail("Expected request to fail with NOT_FOUND but it succeeded")
+        } catch (e: ResponseException) {
+            assertEquals("Unexpected status", RestStatus.NOT_FOUND, e.response.restStatus())
+        }
+    }
+
+    fun `test create ppl monitor with too many triggers fails`() {
+        adminClient().updateSettings(MAX_PPL_TRIGGERS_PER_MONITOR.key, 1)
+
+        try {
+            createRandomPPLMonitor(
+                randomPPLMonitor(
+                    triggers = listOf(
+                        randomPPLTrigger(
+                            conditionType = ConditionType.NUMBER_OF_RESULTS,
+                            numResultsCondition = PPLTrigger.NumResultsCondition.GREATER_THAN,
+                            numResultsValue = 0L,
+                            customCondition = null
+                        ),
+                        randomPPLTrigger(
+                            conditionType = ConditionType.NUMBER_OF_RESULTS,
+                            numResultsCondition = PPLTrigger.NumResultsCondition.GREATER_THAN,
+                            numResultsValue = 5L,
+                            customCondition = null
+                        )
+                    )
+                )
+            )
+            fail("Expected request to fail with BAD_REQUEST but it succeeded")
+        } catch (e: ResponseException) {
+            assertEquals("Unexpected status", RestStatus.BAD_REQUEST, e.response.restStatus())
+        }
+
+        // ensure no monitor was created
+        ensureNumMonitors(0)
     }
 }

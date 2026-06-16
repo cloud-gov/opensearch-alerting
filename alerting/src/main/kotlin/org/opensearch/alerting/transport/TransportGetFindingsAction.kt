@@ -11,6 +11,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.apache.logging.log4j.LogManager
 import org.apache.lucene.search.join.ScoreMode
+import org.opensearch.OpenSearchStatusException
 import org.opensearch.action.ActionRequest
 import org.opensearch.action.get.MultiGetRequest
 import org.opensearch.action.get.MultiGetResponse
@@ -18,6 +19,7 @@ import org.opensearch.action.search.SearchRequest
 import org.opensearch.action.search.SearchResponse
 import org.opensearch.action.support.ActionFilters
 import org.opensearch.action.support.HandledTransportAction
+import org.opensearch.alerting.AlertingPlugin
 import org.opensearch.alerting.alerts.AlertIndices.Companion.ALL_FINDING_INDEX_PATTERN
 import org.opensearch.alerting.opensearchapi.suspendUntil
 import org.opensearch.alerting.settings.AlertingSettings
@@ -36,10 +38,12 @@ import org.opensearch.commons.alerting.model.Finding
 import org.opensearch.commons.alerting.model.FindingDocument
 import org.opensearch.commons.alerting.model.FindingWithDocs
 import org.opensearch.commons.alerting.util.AlertingException
+import org.opensearch.commons.utils.TenantContext
 import org.opensearch.commons.utils.recreateObject
 import org.opensearch.core.action.ActionListener
 import org.opensearch.core.common.Strings
 import org.opensearch.core.common.io.stream.NamedWriteableRegistry
+import org.opensearch.core.rest.RestStatus
 import org.opensearch.core.xcontent.NamedXContentRegistry
 import org.opensearch.core.xcontent.XContentParser
 import org.opensearch.core.xcontent.XContentParserUtils
@@ -72,6 +76,8 @@ class TransportGetFindingsSearchAction @Inject constructor(
 
     @Volatile override var filterByEnabled = AlertingSettings.FILTER_BY_BACKEND_ROLES.get(settings)
 
+    private val multiTenancyEnabled = AlertingSettings.MULTI_TENANCY_ENABLED.get(settings)
+
     init {
         listenFilterBySettingChange(clusterService)
     }
@@ -81,6 +87,18 @@ class TransportGetFindingsSearchAction @Inject constructor(
         request: ActionRequest,
         actionListener: ActionListener<GetFindingsResponse>
     ) {
+        if (multiTenancyEnabled) {
+            actionListener.onFailure(
+                AlertingException.wrap(
+                    OpenSearchStatusException(
+                        "Findings operations are not allowed when multi-tenancy is enabled.",
+                        RestStatus.METHOD_NOT_ALLOWED
+                    )
+                )
+            )
+            return
+        }
+
         val getFindingsRequest = request as? GetFindingsRequest
             ?: recreateObject(request, namedWriteableRegistry) { GetFindingsRequest(it) }
         val tableProp = getFindingsRequest.table
@@ -132,8 +150,9 @@ class TransportGetFindingsSearchAction @Inject constructor(
                 )
         }
         searchSourceBuilder.query(queryBuilder).trackTotalHits(true)
+        val tenantId = client.threadPool().threadContext.getHeader(AlertingPlugin.TENANT_ID_HEADER)
         client.threadPool().threadContext.stashContext().use {
-            scope.launch {
+            scope.launch(TenantContext(tenantId)) {
                 try {
                     val indexName = resolveFindingsIndexName(getFindingsRequest)
                     val getFindingsResponse = search(searchSourceBuilder, indexName)

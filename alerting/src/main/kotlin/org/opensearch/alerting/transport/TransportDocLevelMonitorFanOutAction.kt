@@ -26,6 +26,7 @@ import org.opensearch.action.search.SearchResponse
 import org.opensearch.action.support.ActionFilters
 import org.opensearch.action.support.HandledTransportAction
 import org.opensearch.alerting.AlertService
+import org.opensearch.alerting.AlertingPlugin
 import org.opensearch.alerting.MonitorRunnerService
 import org.opensearch.alerting.TriggerService
 import org.opensearch.alerting.action.GetDestinationsAction
@@ -52,6 +53,8 @@ import org.opensearch.alerting.settings.AlertingSettings.Companion.MAX_ACTIONABL
 import org.opensearch.alerting.settings.AlertingSettings.Companion.PERCOLATE_QUERY_DOCS_SIZE_MEMORY_PERCENTAGE_LIMIT
 import org.opensearch.alerting.settings.AlertingSettings.Companion.PERCOLATE_QUERY_MAX_NUM_DOCS_IN_MEMORY
 import org.opensearch.alerting.settings.DestinationSettings
+import org.opensearch.alerting.util.MAX_SEARCH_SIZE
+import org.opensearch.alerting.util.MustacheTemplateService
 import org.opensearch.alerting.util.defaultToPerExecutionAction
 import org.opensearch.alerting.util.destinationmigration.NotificationActionConfigs
 import org.opensearch.alerting.util.destinationmigration.NotificationApiUtils
@@ -59,6 +62,7 @@ import org.opensearch.alerting.util.destinationmigration.getTitle
 import org.opensearch.alerting.util.destinationmigration.publishLegacyNotification
 import org.opensearch.alerting.util.destinationmigration.sendNotification
 import org.opensearch.alerting.util.getActionExecutionPolicy
+import org.opensearch.alerting.util.getCancelAfterTimeInterval
 import org.opensearch.alerting.util.isAllowed
 import org.opensearch.alerting.util.isTestAction
 import org.opensearch.alerting.util.parseSampleDocTags
@@ -68,6 +72,7 @@ import org.opensearch.cluster.routing.Preference
 import org.opensearch.cluster.service.ClusterService
 import org.opensearch.common.inject.Inject
 import org.opensearch.common.settings.Settings
+import org.opensearch.common.unit.TimeValue
 import org.opensearch.common.xcontent.XContentFactory
 import org.opensearch.common.xcontent.XContentType
 import org.opensearch.commons.alerting.AlertingPluginInterface
@@ -97,6 +102,7 @@ import org.opensearch.commons.alerting.model.userErrorMessage
 import org.opensearch.commons.alerting.util.AlertingException
 import org.opensearch.commons.alerting.util.string
 import org.opensearch.commons.notifications.model.NotificationConfigInfo
+import org.opensearch.commons.utils.TenantContext
 import org.opensearch.core.action.ActionListener
 import org.opensearch.core.common.Strings
 import org.opensearch.core.common.bytes.BytesReference
@@ -113,7 +119,6 @@ import org.opensearch.monitor.jvm.JvmStats
 import org.opensearch.percolator.PercolateQueryBuilderExt
 import org.opensearch.script.Script
 import org.opensearch.script.ScriptService
-import org.opensearch.script.TemplateScript
 import org.opensearch.search.SearchHit
 import org.opensearch.search.SearchHits
 import org.opensearch.search.builder.SearchSourceBuilder
@@ -202,7 +207,8 @@ class TransportDocLevelMonitorFanOutAction
         request: DocLevelMonitorFanOutRequest,
         listener: ActionListener<DocLevelMonitorFanOutResponse>
     ) {
-        scope.launch {
+        val tenantId = client.threadPool().threadContext.getHeader(AlertingPlugin.TENANT_ID_HEADER)
+        scope.launch(TenantContext(tenantId)) {
             executeMonitor(request, listener)
         }
     }
@@ -400,7 +406,7 @@ class TransportDocLevelMonitorFanOutAction
             } else {
                 listOf()
             }
-            val triggerCtx = DocumentLevelTriggerExecutionContext(monitor, trigger)
+            val triggerCtx = DocumentLevelTriggerExecutionContext(monitor, trigger, clusterSettings = clusterService.clusterSettings)
             val alert = alertService.composeDocLevelAlert(
                 findingIds!!,
                 triggerResult.triggeredDocs,
@@ -445,7 +451,7 @@ class TransportDocLevelMonitorFanOutAction
         findingIdToDocSource: MutableMap<String, MultiGetItemResponse>,
         workflowRunContext: WorkflowRunContext?
     ): DocumentLevelTriggerRunResult {
-        val triggerCtx = DocumentLevelTriggerExecutionContext(monitor, trigger)
+        val triggerCtx = DocumentLevelTriggerExecutionContext(monitor, trigger, clusterSettings = clusterService.clusterSettings)
         val triggerResult = triggerService.runDocLevelTrigger(monitor, trigger, queryToDocIds)
 
         val triggerFindingDocPairs = mutableListOf<Pair<String, String>>()
@@ -970,6 +976,11 @@ class TransportDocLevelMonitorFanOutAction
                     .query(boolQueryBuilder)
             )
 
+        val cancelTimeout = getCancelAfterTimeInterval()
+        if (cancelTimeout != -1L) {
+            request.cancelAfterTimeInterval = TimeValue.timeValueMinutes(cancelTimeout)
+        }
+
         val response: SearchResponse = client.suspendUntil { client.search(request, it) }
         if (response.status() !== RestStatus.OK) {
             throw IOException(
@@ -1013,7 +1024,12 @@ class TransportDocLevelMonitorFanOutAction
             SearchRequest().indices(*queryIndices.toTypedArray()).preference(Preference.PRIMARY_FIRST.type())
         val searchSourceBuilder = SearchSourceBuilder()
         searchSourceBuilder.query(boolQueryBuilder)
+        searchSourceBuilder.size(MAX_SEARCH_SIZE)
         searchRequest.source(searchSourceBuilder)
+        val cancelTimeout = getCancelAfterTimeInterval()
+        if (cancelTimeout != -1L) {
+            searchRequest.cancelAfterTimeInterval = TimeValue.timeValueMinutes(cancelTimeout)
+        }
         log.debug(
             "Monitor ${monitor.id}: " +
                 "Executing percolate query for docs from source indices " +
@@ -1092,6 +1108,11 @@ class TransportDocLevelMonitorFanOutAction
                     .query(boolQueryBuilder)
                     .size(docLevelMonitorShardFetchSize)
             )
+
+        val cancelTimeout = getCancelAfterTimeInterval()
+        if (cancelTimeout != -1L) {
+            request.cancelAfterTimeInterval = TimeValue.timeValueMinutes(cancelTimeout)
+        }
 
         if (fieldsToFetch.isNotEmpty() && fetchOnlyQueryFieldNames) {
             request.source().fetchSource(false)
@@ -1349,10 +1370,10 @@ class TransportDocLevelMonitorFanOutAction
         return DestinationContextFactory(client, xContentRegistry, destinationSettings)
     }
 
+    private val mustacheTemplateService = MustacheTemplateService(scriptService, settings)
+
     private fun compileTemplate(template: Script, ctx: TriggerExecutionContext): String {
-        return scriptService.compile(template, TemplateScript.CONTEXT)
-            .newInstance(template.params + mapOf("ctx" to ctx.asTemplateArg()))
-            .execute()
+        return mustacheTemplateService.renderScript(template, mapOf("ctx" to ctx.asTemplateArg()))
     }
 
     private suspend fun onSuccessfulMonitorRun(monitor: Monitor) {

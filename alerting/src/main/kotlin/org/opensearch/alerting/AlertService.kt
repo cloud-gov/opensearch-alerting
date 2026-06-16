@@ -7,30 +7,21 @@ package org.opensearch.alerting
 
 import org.apache.logging.log4j.LogManager
 import org.opensearch.ExceptionsHelper
-import org.opensearch.action.DocWriteRequest
 import org.opensearch.action.bulk.BackoffPolicy
-import org.opensearch.action.bulk.BulkRequest
-import org.opensearch.action.bulk.BulkResponse
-import org.opensearch.action.delete.DeleteRequest
-import org.opensearch.action.index.IndexRequest
-import org.opensearch.action.index.IndexResponse
-import org.opensearch.action.search.SearchRequest
 import org.opensearch.action.search.SearchResponse
-import org.opensearch.action.support.WriteRequest
 import org.opensearch.alerting.alerts.AlertIndices
 import org.opensearch.alerting.opensearchapi.firstFailureOrNull
 import org.opensearch.alerting.opensearchapi.retry
-import org.opensearch.alerting.opensearchapi.suspendUntil
 import org.opensearch.alerting.script.ChainedAlertTriggerExecutionContext
 import org.opensearch.alerting.script.DocumentLevelTriggerExecutionContext
 import org.opensearch.alerting.script.QueryLevelTriggerExecutionContext
 import org.opensearch.alerting.util.CommentsUtils
 import org.opensearch.alerting.util.IndexUtils
 import org.opensearch.alerting.util.MAX_SEARCH_SIZE
+import org.opensearch.alerting.util.await
 import org.opensearch.alerting.util.getBucketKeysHash
 import org.opensearch.common.unit.TimeValue
 import org.opensearch.common.xcontent.LoggingDeprecationHandler
-import org.opensearch.common.xcontent.XContentFactory
 import org.opensearch.common.xcontent.XContentHelper
 import org.opensearch.common.xcontent.XContentType
 import org.opensearch.commons.alerting.alerts.AlertError
@@ -44,22 +35,30 @@ import org.opensearch.commons.alerting.model.ClusterMetricsTriggerRunResult
 import org.opensearch.commons.alerting.model.DataSources
 import org.opensearch.commons.alerting.model.Monitor
 import org.opensearch.commons.alerting.model.NoOpTrigger
+import org.opensearch.commons.alerting.model.PPLInput
 import org.opensearch.commons.alerting.model.QueryLevelTriggerRunResult
 import org.opensearch.commons.alerting.model.Trigger
 import org.opensearch.commons.alerting.model.Workflow
 import org.opensearch.commons.alerting.model.WorkflowRunContext
 import org.opensearch.commons.alerting.model.action.AlertCategory
+import org.opensearch.commons.alerting.util.isPPLMonitor
+import org.opensearch.commons.utils.currentTenantId
 import org.opensearch.core.action.ActionListener
 import org.opensearch.core.common.bytes.BytesReference
 import org.opensearch.core.rest.RestStatus
 import org.opensearch.core.xcontent.NamedXContentRegistry
+import org.opensearch.core.xcontent.ToXContentObject
 import org.opensearch.core.xcontent.XContentParser
 import org.opensearch.core.xcontent.XContentParserUtils
-import org.opensearch.index.VersionType
 import org.opensearch.index.query.QueryBuilders
 import org.opensearch.index.reindex.BulkByScrollResponse
 import org.opensearch.index.reindex.DeleteByQueryAction
 import org.opensearch.index.reindex.DeleteByQueryRequestBuilder
+import org.opensearch.remote.metadata.client.BulkDataObjectRequest
+import org.opensearch.remote.metadata.client.DeleteDataObjectRequest
+import org.opensearch.remote.metadata.client.PutDataObjectRequest
+import org.opensearch.remote.metadata.client.SdkClient
+import org.opensearch.remote.metadata.client.SearchDataObjectRequest
 import org.opensearch.search.builder.SearchSourceBuilder
 import org.opensearch.search.sort.SortOrder
 import org.opensearch.transport.client.Client
@@ -74,7 +73,8 @@ import kotlin.coroutines.suspendCoroutine
 class AlertService(
     val client: Client,
     val xContentRegistry: NamedXContentRegistry,
-    val alertIndices: AlertIndices
+    val alertIndices: AlertIndices,
+    val sdkClient: SdkClient
 ) {
 
     companion object {
@@ -107,6 +107,11 @@ class AlertService(
     }
 
     suspend fun loadCurrentAlertsForQueryLevelMonitor(monitor: Monitor, workflowRunContext: WorkflowRunContext?): Map<Trigger, Alert?> {
+        // Return early for dry-run
+        if (monitor.id.isBlank()) {
+            return monitor.triggers.associateWith { null }
+        }
+
         val searchAlertsResponse: SearchResponse = searchAlerts(
             monitor = monitor,
             size = monitor.triggers.size * 2, // We expect there to be only a single in-progress alert so fetch 2 to check
@@ -130,6 +135,11 @@ class AlertService(
         monitor: Monitor,
         workflowRunContext: WorkflowRunContext?,
     ): Map<Trigger, MutableMap<String, Alert>> {
+        // Return early for dry-run
+        if (monitor.id.isBlank()) {
+            return monitor.triggers.associateWith { mutableMapOf() }
+        }
+
         val searchAlertsResponse: SearchResponse = searchAlerts(
             monitor = monitor,
             // TODO: This should be limited based on a circuit breaker that limits Alerts
@@ -205,6 +215,13 @@ class AlertService(
                 }
             }
 
+        // these fields are only populated for PPL Monitors for now.
+        // this can be extended to let DSL-based Monitors like Query
+        // or Bucket level Monitors include their results in Alerts
+        // as well
+        val query = if (ctx.monitor.isPPLMonitor()) (ctx.monitor.inputs[0] as PPLInput).query else null
+        val queryResults = if (ctx.monitor.isPPLMonitor()) ctx.pplQueryResults else emptyList()
+
         // Merge the alert's error message to the current alert's history
         val updatedHistory = currentAlert?.errorHistory.update(alertError)
         return if (alertError == null && !result.triggered) {
@@ -215,7 +232,9 @@ class AlertService(
                 errorHistory = updatedHistory,
                 actionExecutionResults = updatedActionExecutionResults,
                 schemaVersion = IndexUtils.alertIndexSchemaVersion,
-                clusters = triggeredClusters
+                clusters = triggeredClusters,
+                query = query,
+                queryResults = queryResults
             )
         } else if (alertError == null && currentAlert?.isAcknowledged() == true) {
             null
@@ -228,7 +247,9 @@ class AlertService(
                 errorHistory = updatedHistory,
                 actionExecutionResults = updatedActionExecutionResults,
                 schemaVersion = IndexUtils.alertIndexSchemaVersion,
-                clusters = triggeredClusters
+                clusters = triggeredClusters,
+                query = query,
+                queryResults = queryResults
             )
         } else {
             val alertState = if (workflorwRunContext?.auditDelegateMonitorAlerts == true) {
@@ -241,7 +262,7 @@ class AlertService(
                 errorHistory = updatedHistory, actionExecutionResults = updatedActionExecutionResults,
                 schemaVersion = IndexUtils.alertIndexSchemaVersion, executionId = executionId,
                 workflowId = workflorwRunContext?.workflowId ?: "",
-                clusters = triggeredClusters
+                clusters = triggeredClusters, query = query, queryResults = queryResults
             )
         }
     }
@@ -483,8 +504,11 @@ class AlertService(
     ) {
         val newErrorAlertId = "$ERROR_ALERT_ID_PREFIX-${monitor.id}-${UUID.randomUUID()}"
 
-        val searchRequest = SearchRequest(monitor.dataSources.alertsIndex)
-            .source(
+        val searchRequest = SearchDataObjectRequest.builder()
+            .indices(monitor.dataSources.alertsIndex)
+            .tenantId(currentTenantId())
+            .routing(monitor.id)
+            .searchSourceBuilder(
                 SearchSourceBuilder()
                     .sort(Alert.START_TIME_FIELD, SortOrder.DESC)
                     .query(
@@ -493,7 +517,9 @@ class AlertService(
                             .must(QueryBuilders.termQuery(Alert.STATE_FIELD, Alert.State.ERROR.name))
                     )
             )
-        val searchResponse: SearchResponse = client.suspendUntil { search(searchRequest, it) }
+            .build()
+        val searchResponse: SearchResponse = sdkClient.searchDataObjectAsync(searchRequest).await()
+            .searchResponse() ?: throw RuntimeException("Unknown error searching for error alerts")
 
         var alert =
             composeMonitorErrorAlert(newErrorAlertId, monitor, AlertError(Instant.now(), errorMessage), executionId, workflowRunContext)
@@ -523,22 +549,31 @@ class AlertService(
             }
         }
 
-        val alertIndexRequest = IndexRequest(monitor.dataSources.alertsIndex)
-            .routing(alert.monitorId)
-            .source(alert.toXContentWithUser(XContentFactory.jsonBuilder()))
-            .opType(DocWriteRequest.OpType.INDEX)
-            .setRefreshPolicy(WriteRequest.RefreshPolicy.IMMEDIATE)
+        val putRequest = PutDataObjectRequest.builder()
+            .index(monitor.dataSources.alertsIndex)
             .id(alert.id)
-
-        val indexResponse: IndexResponse = client.suspendUntil { index(alertIndexRequest, it) }
-        logger.debug("Monitor error Alert successfully upserted. Op result: ${indexResponse.result}")
+            .routing(alert.monitorId)
+            .tenantId(currentTenantId())
+            .overwriteIfExists(true)
+            .dataObject(ToXContentObject { builder, _ -> alert.toXContentWithUser(builder) })
+            .build()
+        val putResponse = sdkClient.putDataObjectAsync(putRequest).await()
+        if (putResponse.isFailed) {
+            throw ExceptionsHelper.convertToOpenSearchException(
+                putResponse.cause() ?: RuntimeException("Failed to upsert monitor error alert")
+            )
+        }
+        logger.debug("Monitor error Alert successfully upserted. Op result: ${putResponse.indexResponse()?.result}")
     }
 
     suspend fun clearMonitorErrorAlert(monitor: Monitor) {
         val currentTime = Instant.now()
         try {
-            val searchRequest = SearchRequest("${monitor.dataSources.alertsIndex}")
-                .source(
+            val searchRequest = SearchDataObjectRequest.builder()
+                .indices(monitor.dataSources.alertsIndex)
+                .tenantId(currentTenantId())
+                .routing(monitor.id)
+                .searchSourceBuilder(
                     SearchSourceBuilder()
                         .size(MAX_SEARCH_SIZE)
                         .sort(Alert.START_TIME_FIELD, SortOrder.DESC)
@@ -547,46 +582,43 @@ class AlertService(
                                 .must(QueryBuilders.termQuery(Alert.MONITOR_ID_FIELD, monitor.id))
                                 .must(QueryBuilders.termQuery(Alert.STATE_FIELD, Alert.State.ERROR.name))
                         )
-
                 )
-            searchRequest.cancelAfterTimeInterval = ALERTS_SEARCH_TIMEOUT
-            val searchResponse: SearchResponse = client.suspendUntil { search(searchRequest, it) }
+                .build()
+            val searchResponse: SearchResponse = sdkClient.searchDataObjectAsync(searchRequest).await()
+                .searchResponse() ?: throw RuntimeException("Unknown error searching for error alerts")
             // If there's no error alert present, there's nothing to clear. We can stop here.
             if (searchResponse.hits.totalHits.value == 0L) {
                 return
             }
 
-            val indexRequests = mutableListOf<IndexRequest>()
+            val bulkRequest = BulkDataObjectRequest(monitor.dataSources.alertsIndex)
             searchResponse.hits.hits.forEach { hit ->
                 if (searchResponse.hits.totalHits.value > 1L) {
                     logger.warn("Found [${searchResponse.hits.totalHits.value}] error alerts for monitor [${monitor.id}] while clearing")
                 }
-                // Deserialize first/latest Alert
                 val xcp = contentParser(hit.sourceRef)
                 val existingErrorAlert = Alert.parse(xcp, hit.id, hit.version)
+                val updatedAlert = existingErrorAlert.copy(endTime = currentTime)
 
-                val updatedAlert = existingErrorAlert.copy(
-                    endTime = currentTime
+                bulkRequest.add(
+                    PutDataObjectRequest.builder()
+                        .index(monitor.dataSources.alertsIndex)
+                        .id(updatedAlert.id)
+                        .routing(monitor.id)
+                        .tenantId(currentTenantId())
+                        .overwriteIfExists(true)
+                        .dataObject(ToXContentObject { builder, _ -> updatedAlert.toXContentWithUser(builder) })
+                        .build()
                 )
-
-                indexRequests += IndexRequest(monitor.dataSources.alertsIndex)
-                    .routing(monitor.id)
-                    .id(updatedAlert.id)
-                    .source(updatedAlert.toXContentWithUser(XContentFactory.jsonBuilder()))
-                    .opType(DocWriteRequest.OpType.INDEX)
             }
 
-            val bulkResponse: BulkResponse = client.suspendUntil {
-                bulk(BulkRequest().add(indexRequests).setRefreshPolicy(WriteRequest.RefreshPolicy.IMMEDIATE), it)
-            }
+            val bulkResponse = sdkClient.bulkDataObjectAsync(bulkRequest).await()
             if (bulkResponse.hasFailures()) {
-                bulkResponse.items.forEach { item ->
-                    if (item.isFailed) {
-                        logger.debug("Failed clearing error alert ${item.id} of monitor [${monitor.id}]")
-                    }
+                bulkResponse.responses.filter { it.isFailed }.forEach { item ->
+                    logger.debug("Failed clearing error alert ${item.id()} of monitor [${monitor.id}]")
                 }
             } else {
-                logger.debug("[${bulkResponse.items.size}] Error Alerts successfully cleared. End time set to: $currentTime")
+                logger.debug("[${searchResponse.hits.totalHits.value}] Error Alerts successfully cleared. End time set to: $currentTime")
             }
         } catch (e: Exception) {
             logger.error("Error clearing monitor error alerts for monitor [${monitor.id}]: ${ExceptionsHelper.detailedMessage(e)}")
@@ -599,8 +631,11 @@ class AlertService(
      * */
     suspend fun moveClearedErrorAlertsToHistory(monitorId: String, alertIndex: String, alertHistoryIndex: String) {
         try {
-            val searchRequest = SearchRequest(alertIndex)
-                .source(
+            val searchRequest = SearchDataObjectRequest.builder()
+                .indices(alertIndex)
+                .tenantId(currentTenantId())
+                .routing(monitorId)
+                .searchSourceBuilder(
                     SearchSourceBuilder()
                         .size(MAX_SEARCH_SIZE)
                         .query(
@@ -609,43 +644,38 @@ class AlertService(
                                 .must(QueryBuilders.termQuery(Alert.STATE_FIELD, Alert.State.ERROR.name))
                                 .must(QueryBuilders.existsQuery(Alert.END_TIME_FIELD))
                         )
-                        .version(true) // Do we need this?
+                        .version(true)
                 )
-            searchRequest.cancelAfterTimeInterval = ALERTS_SEARCH_TIMEOUT
-            val searchResponse: SearchResponse = client.suspendUntil { search(searchRequest, it) }
+                .build()
+            val searchResponse: SearchResponse = sdkClient.searchDataObjectAsync(searchRequest).await()
+                .searchResponse() ?: throw RuntimeException("Unknown error searching for cleared error alerts")
 
             if (searchResponse.hits.totalHits.value == 0L) {
                 return
             }
 
             // Copy to history index
-
-            val copyRequests = mutableListOf<IndexRequest>()
-
+            val bulkRequest = BulkDataObjectRequest(null)
             searchResponse.hits.hits.forEach { hit ->
-
                 val xcp = contentParser(hit.sourceRef)
                 val alert = Alert.parse(xcp, hit.id, hit.version)
 
-                copyRequests.add(
-                    IndexRequest(alertHistoryIndex)
-                        .routing(alert.monitorId)
-                        .source(hit.sourceRef, XContentType.JSON)
-                        .version(hit.version)
-                        .versionType(VersionType.EXTERNAL_GTE)
+                bulkRequest.add(
+                    PutDataObjectRequest.builder()
+                        .index(alertHistoryIndex)
                         .id(hit.id)
-                        .timeout(MonitorRunnerService.monitorCtx.indexTimeout)
+                        .routing(alert.monitorId)
+                        .tenantId(currentTenantId())
+                        .overwriteIfExists(true)
+                        .dataObject(ToXContentObject { builder, _ -> alert.toXContentWithUser(builder) })
+                        .build()
                 )
             }
 
-            val bulkResponse: BulkResponse = client.suspendUntil {
-                bulk(BulkRequest().add(copyRequests).setRefreshPolicy(WriteRequest.RefreshPolicy.IMMEDIATE), it)
-            }
+            val bulkResponse = sdkClient.bulkDataObjectAsync(bulkRequest).await()
             if (bulkResponse.hasFailures()) {
-                bulkResponse.items.forEach { item ->
-                    if (item.isFailed) {
-                        logger.error("Failed copying error alert [${item.id}] to history index [$alertHistoryIndex]")
-                    }
+                bulkResponse.responses.filter { it.isFailed }.forEach { item ->
+                    logger.error("Failed copying error alert [${item.id()}] to history index [$alertHistoryIndex]")
                 }
                 return
             }
@@ -687,29 +717,34 @@ class AlertService(
 
         val commentIdsToDelete = mutableListOf<String>()
 
-        var requestsToRetry = alerts.flatMap { alert ->
-            // We don't want to set the version when saving alerts because the MonitorRunner has first priority when writing alerts.
-            // In the rare event that a user acknowledges an alert between when it's read and when it's written
-            // back we're ok if that acknowledgement is lost. It's easier to get the user to retry than for the runner to
-            // spend time reloading the alert and writing it back.
+        val putRequests = mutableListOf<PutDataObjectRequest>()
+        val deleteRequests = mutableListOf<DeleteDataObjectRequest>()
+
+        alerts.forEach { alert ->
             when (alert.state) {
                 Alert.State.ACTIVE, Alert.State.ERROR -> {
-                    listOf<DocWriteRequest<*>>(
-                        IndexRequest(alertsIndex)
-                            .routing(routingId)
-                            .source(alert.toXContentWithUser(XContentFactory.jsonBuilder()))
+                    putRequests.add(
+                        PutDataObjectRequest.builder()
+                            .index(alertsIndex)
                             .id(if (alert.id != Alert.NO_ID) alert.id else null)
+                            .routing(routingId)
+                            .tenantId(currentTenantId())
+                            .overwriteIfExists(true)
+                            .dataObject(ToXContentObject { builder, _ -> alert.toXContentWithUser(builder) })
+                            .build()
                     )
                 }
                 Alert.State.ACKNOWLEDGED -> {
-                    // Allow ACKNOWLEDGED Alerts to be updated for Bucket-Level Monitors since de-duped Alerts can be ACKNOWLEDGED
-                    // and updated by the MonitorRunner
                     if (allowUpdatingAcknowledgedAlert) {
-                        listOf<DocWriteRequest<*>>(
-                            IndexRequest(alertsIndex)
-                                .routing(routingId)
-                                .source(alert.toXContentWithUser(XContentFactory.jsonBuilder()))
+                        putRequests.add(
+                            PutDataObjectRequest.builder()
+                                .index(alertsIndex)
                                 .id(if (alert.id != Alert.NO_ID) alert.id else null)
+                                .routing(routingId)
+                                .tenantId(currentTenantId())
+                                .overwriteIfExists(true)
+                                .dataObject(ToXContentObject { builder, _ -> alert.toXContentWithUser(builder) })
+                                .build()
                         )
                     } else {
                         throw IllegalStateException("Unexpected attempt to save ${alert.state} alert: $alert")
@@ -719,52 +754,59 @@ class AlertService(
                     val index = if (alertIndices.isAlertHistoryEnabled()) {
                         dataSources.alertsHistoryIndex
                     } else dataSources.alertsIndex
-                    listOf<DocWriteRequest<*>>(
-                        IndexRequest(index)
-                            .routing(routingId)
-                            .source(alert.toXContentWithUser(XContentFactory.jsonBuilder()))
+                    putRequests.add(
+                        PutDataObjectRequest.builder()
+                            .index(index)
                             .id(if (alert.id != Alert.NO_ID) alert.id else null)
+                            .routing(routingId)
+                            .tenantId(currentTenantId())
+                            .overwriteIfExists(true)
+                            .dataObject(ToXContentObject { builder, _ -> alert.toXContentWithUser(builder) })
+                            .build()
                     )
                 }
                 Alert.State.DELETED -> {
                     throw IllegalStateException("Unexpected attempt to save ${alert.state} alert: $alert")
                 }
                 Alert.State.COMPLETED -> {
-                    listOfNotNull<DocWriteRequest<*>>(
-                        DeleteRequest(alertsIndex, alert.id)
-                            .routing(routingId),
-                        if (alertIndices.isAlertHistoryEnabled()) {
-                            // Only add completed alert to history index if history is enabled
-                            IndexRequest(alertsHistoryIndex)
-                                .routing(routingId)
-                                .source(alert.toXContentWithUser(XContentFactory.jsonBuilder()))
-                                .id(alert.id)
-                        } else {
-                            // Otherwise, prepare the Alert's comments for deletion, and don't include
-                            // a request to index the Alert to an Alert history index.
-                            // The delete request can't be added to the list of DocWriteRequests because
-                            // Comments are stored in aliased history indices, not a concrete Comments
-                            // index like Alerts. A DeleteBy request will be used to delete Comments, instead
-                            // of a regular Delete request
-                            commentIdsToDelete.addAll(CommentsUtils.getCommentIDsByAlertIDs(client, listOf(alert.id)))
-                            null
-                        }
+                    deleteRequests.add(
+                        DeleteDataObjectRequest.builder()
+                            .index(alertsIndex)
+                            .id(alert.id)
+                            .routing(routingId)
+                            .tenantId(currentTenantId())
+                            .build()
                     )
+                    if (alertIndices.isAlertHistoryEnabled()) {
+                        putRequests.add(
+                            PutDataObjectRequest.builder()
+                                .index(alertsHistoryIndex)
+                                .id(alert.id)
+                                .routing(routingId)
+                                .tenantId(currentTenantId())
+                                .overwriteIfExists(true)
+                                .dataObject(ToXContentObject { builder, _ -> alert.toXContentWithUser(builder) })
+                                .build()
+                        )
+                    } else {
+                        commentIdsToDelete.addAll(CommentsUtils.getCommentIDsByAlertIDs(client, listOf(alert.id)))
+                    }
                 }
             }
         }
 
-        if (requestsToRetry.isEmpty()) return
+        if (putRequests.isEmpty() && deleteRequests.isEmpty()) return
         // Retry Bulk requests if there was any 429 response
         retryPolicy.retry(logger, listOf(RestStatus.TOO_MANY_REQUESTS)) {
-            val bulkRequest = BulkRequest().add(requestsToRetry).setRefreshPolicy(WriteRequest.RefreshPolicy.IMMEDIATE)
-            val bulkResponse: BulkResponse = client.suspendUntil { client.bulk(bulkRequest, it) }
-            val failedResponses = (bulkResponse.items ?: arrayOf()).filter { it.isFailed }
-            requestsToRetry = failedResponses.filter { it.status() == RestStatus.TOO_MANY_REQUESTS }
-                .map { bulkRequest.requests()[it.itemId] as IndexRequest }
+            val bulkRequest = BulkDataObjectRequest(null)
+            putRequests.forEach { bulkRequest.add(it) }
+            deleteRequests.forEach { bulkRequest.add(it) }
+            val bulkResponse = sdkClient.bulkDataObjectAsync(bulkRequest).await()
+            val failedResponses = bulkResponse.responses.filter { it.isFailed }
+            val retryableFailures = failedResponses.filter { it.status() == RestStatus.TOO_MANY_REQUESTS }
 
-            if (requestsToRetry.isNotEmpty()) {
-                val retryCause = failedResponses.first { it.status() == RestStatus.TOO_MANY_REQUESTS }.failure.cause
+            if (retryableFailures.isNotEmpty()) {
+                val retryCause = retryableFailures.first().cause()
                 throw ExceptionsHelper.convertToOpenSearchException(retryCause)
             }
         }
@@ -784,7 +826,7 @@ class AlertService(
     suspend fun saveNewAlerts(dataSources: DataSources, alerts: List<Alert>, retryPolicy: BackoffPolicy): List<Alert> {
         val savedAlerts = mutableListOf<Alert>()
         var alertsBeingIndexed = alerts
-        var requestsToRetry: MutableList<IndexRequest> = alerts.map { alert ->
+        var requestsToRetry: MutableList<PutDataObjectRequest> = alerts.map { alert ->
             if (alert.state != Alert.State.ACTIVE && alert.state != Alert.State.AUDIT) {
                 throw IllegalStateException("Unexpected attempt to save new alert [$alert] with state [${alert.state}]")
             }
@@ -794,43 +836,50 @@ class AlertService(
             val alertIndex = if (alert.state == Alert.State.AUDIT && alertIndices.isAlertHistoryEnabled()) {
                 dataSources.alertsHistoryIndex
             } else dataSources.alertsIndex
-            IndexRequest(alertIndex)
+            PutDataObjectRequest.builder()
+                .index(alertIndex)
                 .routing(alert.monitorId)
-                .source(alert.toXContentWithUser(XContentFactory.jsonBuilder()))
+                .tenantId(currentTenantId())
+                .overwriteIfExists(false)
+                .dataObject(ToXContentObject { builder, _ -> alert.toXContentWithUser(builder) })
+                .build()
         }.toMutableList()
 
         if (requestsToRetry.isEmpty()) return listOf()
 
-        // Retry Bulk requests if there was any 429 response.
-        // The responses of a bulk request will be in the same order as the individual requests.
-        // If the index request succeeded for an Alert, the document ID from the response is taken and saved in the Alert.
-        // If the index request is to be retried, the Alert is saved separately as well so that its relative ordering is maintained in
-        // relation to index request in the retried bulk request for when it eventually succeeds.
         retryPolicy.retry(logger, listOf(RestStatus.TOO_MANY_REQUESTS)) {
-            val bulkRequest = BulkRequest().add(requestsToRetry).setRefreshPolicy(WriteRequest.RefreshPolicy.IMMEDIATE)
-            val bulkResponse: BulkResponse = client.suspendUntil { client.bulk(bulkRequest, it) }
-            // TODO: This is only used to retrieve the retryCause, could instead fetch it from the bulkResponse iteration below
-            val failedResponses = (bulkResponse.items ?: arrayOf()).filter { it.isFailed }
+            val bulkRequest = BulkDataObjectRequest(null)
+            requestsToRetry.forEach { bulkRequest.add(it) }
+            val bulkResponse = sdkClient.bulkDataObjectAsync(bulkRequest).await()
+            val responses = bulkResponse.responses
 
             requestsToRetry = mutableListOf()
             val alertsBeingRetried = mutableListOf<Alert>()
-            bulkResponse.items.forEach { item ->
+            responses.forEachIndexed { index, item ->
                 if (item.isFailed) {
-                    // TODO: What if the failure cause was not TOO_MANY_REQUESTS, should these be saved and logged?
                     if (item.status() == RestStatus.TOO_MANY_REQUESTS) {
-                        requestsToRetry.add(bulkRequest.requests()[item.itemId] as IndexRequest)
-                        alertsBeingRetried.add(alertsBeingIndexed[item.itemId])
+                        requestsToRetry.add(
+                            PutDataObjectRequest.builder()
+                                .index(requestsToRetry.getOrNull(index)?.index() ?: dataSources.alertsIndex)
+                                .routing(alertsBeingIndexed[index].monitorId)
+                                .tenantId(currentTenantId())
+                                .overwriteIfExists(false)
+                                .dataObject(
+                                    ToXContentObject { builder, _ -> alertsBeingIndexed[index].toXContentWithUser(builder) }
+                                )
+                                .build()
+                        )
+                        alertsBeingRetried.add(alertsBeingIndexed[index])
                     }
                 } else {
-                    // The ID of the BulkItemResponse in this case is the document ID resulting from the DocWriteRequest operation
-                    savedAlerts.add(alertsBeingIndexed[item.itemId].copy(id = item.id))
+                    savedAlerts.add(alertsBeingIndexed[index].copy(id = item.id()))
                 }
             }
 
             alertsBeingIndexed = alertsBeingRetried
 
             if (requestsToRetry.isNotEmpty()) {
-                val retryCause = failedResponses.first { it.status() == RestStatus.TOO_MANY_REQUESTS }.failure.cause
+                val retryCause = responses.first { it.isFailed && it.status() == RestStatus.TOO_MANY_REQUESTS }.cause()
                 throw ExceptionsHelper.convertToOpenSearchException(retryCause)
             }
         }
@@ -866,10 +915,14 @@ class AlertService(
             .size(size)
             .query(queryBuilder)
 
-        val searchRequest = SearchRequest(alertIndex)
+        val searchRequest = SearchDataObjectRequest.builder()
+            .indices(alertIndex)
+            .tenantId(currentTenantId())
             .routing(monitorId)
-            .source(searchSourceBuilder)
-        val searchResponse: SearchResponse = client.suspendUntil { client.search(searchRequest, it) }
+            .searchSourceBuilder(searchSourceBuilder)
+            .build()
+        val searchResponse: SearchResponse = sdkClient.searchDataObjectAsync(searchRequest).await()
+            .searchResponse() ?: throw RuntimeException("Unknown error loading alerts")
         if (searchResponse.status() != RestStatus.OK) {
             throw (searchResponse.firstFailureOrNull()?.cause ?: RuntimeException("Unknown error loading alerts"))
         }
@@ -898,10 +951,14 @@ class AlertService(
             .size(size)
             .query(queryBuilder)
 
-        val searchRequest = SearchRequest(alertIndex)
+        val searchRequest = SearchDataObjectRequest.builder()
+            .indices(alertIndex)
+            .tenantId(currentTenantId())
             .routing(workflowId)
-            .source(searchSourceBuilder)
-        val searchResponse: SearchResponse = client.suspendUntil { client.search(searchRequest, it) }
+            .searchSourceBuilder(searchSourceBuilder)
+            .build()
+        val searchResponse: SearchResponse = sdkClient.searchDataObjectAsync(searchRequest).await()
+            .searchResponse() ?: throw RuntimeException("Unknown error loading alerts")
         if (searchResponse.status() != RestStatus.OK) {
             throw (searchResponse.firstFailureOrNull()?.cause ?: RuntimeException("Unknown error loading alerts"))
         }

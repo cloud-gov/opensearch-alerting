@@ -9,14 +9,15 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import org.apache.logging.log4j.LogManager
+import org.opensearch.OpenSearchStatusException
 import org.opensearch.action.ActionRequest
 import org.opensearch.action.search.SearchRequest
 import org.opensearch.action.search.SearchResponse
 import org.opensearch.action.support.ActionFilters
 import org.opensearch.action.support.HandledTransportAction
+import org.opensearch.alerting.AlertingPlugin
 import org.opensearch.alerting.alerts.AlertIndices
 import org.opensearch.alerting.opensearchapi.addFilter
-import org.opensearch.alerting.opensearchapi.suspendUntil
 import org.opensearch.alerting.settings.AlertingSettings
 import org.opensearch.alerting.util.use
 import org.opensearch.cluster.service.ClusterService
@@ -32,6 +33,8 @@ import org.opensearch.commons.alerting.action.GetWorkflowAlertsResponse
 import org.opensearch.commons.alerting.model.Alert
 import org.opensearch.commons.alerting.util.AlertingException
 import org.opensearch.commons.authuser.User
+import org.opensearch.commons.utils.TenantContext
+import org.opensearch.commons.utils.currentTenantId
 import org.opensearch.commons.utils.recreateObject
 import org.opensearch.core.action.ActionListener
 import org.opensearch.core.rest.RestStatus
@@ -40,6 +43,8 @@ import org.opensearch.core.xcontent.XContentParser
 import org.opensearch.core.xcontent.XContentParserUtils
 import org.opensearch.index.query.Operator
 import org.opensearch.index.query.QueryBuilders
+import org.opensearch.remote.metadata.client.SdkClient
+import org.opensearch.remote.metadata.client.SearchDataObjectRequest
 import org.opensearch.search.builder.SearchSourceBuilder
 import org.opensearch.search.sort.SortBuilders
 import org.opensearch.search.sort.SortOrder
@@ -58,6 +63,7 @@ class TransportGetWorkflowAlertsAction @Inject constructor(
     actionFilters: ActionFilters,
     val settings: Settings,
     val xContentRegistry: NamedXContentRegistry,
+    val sdkClient: SdkClient,
 ) : HandledTransportAction<ActionRequest, GetWorkflowAlertsResponse>(
     AlertingActions.GET_WORKFLOW_ALERTS_ACTION_NAME,
     transportService,
@@ -72,6 +78,8 @@ class TransportGetWorkflowAlertsAction @Inject constructor(
     @Volatile
     private var isAlertHistoryEnabled = AlertingSettings.ALERT_HISTORY_ENABLED.get(settings)
 
+    private val multiTenancyEnabled = AlertingSettings.MULTI_TENANCY_ENABLED.get(settings)
+
     init {
         clusterService.clusterSettings.addSettingsUpdateConsumer(AlertingSettings.ALERT_HISTORY_ENABLED) { isAlertHistoryEnabled = it }
         listenFilterBySettingChange(clusterService)
@@ -82,6 +90,18 @@ class TransportGetWorkflowAlertsAction @Inject constructor(
         request: ActionRequest,
         actionListener: ActionListener<GetWorkflowAlertsResponse>,
     ) {
+        if (multiTenancyEnabled) {
+            actionListener.onFailure(
+                AlertingException.wrap(
+                    OpenSearchStatusException(
+                        "Workflow operations are not allowed when multi-tenancy is enabled.",
+                        RestStatus.METHOD_NOT_ALLOWED
+                    )
+                )
+            )
+            return
+        }
+
         val getWorkflowAlertsRequest = request as? GetWorkflowAlertsRequest
             ?: recreateObject(request) { GetWorkflowAlertsRequest(it) }
         val user = readUserFromThreadContext(client)
@@ -139,8 +159,9 @@ class TransportGetWorkflowAlertsAction @Inject constructor(
             .size(tableProp.size)
             .from(from)
 
+        val tenantId = client.threadPool().threadContext.getHeader(AlertingPlugin.TENANT_ID_HEADER)
         client.threadPool().threadContext.stashContext().use {
-            scope.launch {
+            scope.launch(TenantContext(tenantId)) {
                 try {
                     val alertIndex = resolveAlertsIndexName(getWorkflowAlertsRequest)
                     getAlerts(getWorkflowAlertsRequest, alertIndex, searchSourceBuilder, actionListener, user)
@@ -205,17 +226,20 @@ class TransportGetWorkflowAlertsAction @Inject constructor(
         actionListener: ActionListener<GetWorkflowAlertsResponse>,
     ) {
         try {
-            val searchRequest = SearchRequest()
+            val searchRequest = SearchDataObjectRequest.builder()
                 .indices(alertIndex)
-                .source(searchSourceBuilder)
+                .tenantId(currentTenantId())
+                .searchSourceBuilder(searchSourceBuilder)
+                .build()
             val alerts = mutableListOf<Alert>()
             val associatedAlerts = mutableListOf<Alert>()
 
-            val response: SearchResponse = client.suspendUntil { search(searchRequest, it) }
-            val totalAlertCount = response.hits.totalHits?.value?.toInt()
-            alerts.addAll(
-                parseAlertsFromSearchResponse(response)
-            )
+            val sdkResponse = sdkClient.searchDataObject(searchRequest)
+            val response = sdkResponse.searchResponse()
+            val totalAlertCount = response?.hits?.totalHits?.value?.toInt()
+            if (response != null) {
+                alerts.addAll(parseAlertsFromSearchResponse(response))
+            }
             if (alerts.isNotEmpty() && getWorkflowAlertsRequest.getAssociatedAlerts == true)
                 getAssociatedAlerts(
                     associatedAlerts,
@@ -254,8 +278,16 @@ class TransportGetWorkflowAlertsAction @Inject constructor(
             queryBuilder.must(QueryBuilders.termsQuery("_id", associatedAlertIds))
             queryBuilder.must(QueryBuilders.termQuery(Alert.STATE_FIELD, Alert.State.AUDIT.name))
             searchRequest.source().query(queryBuilder)
-            val response: SearchResponse = client.suspendUntil { search(searchRequest, it) }
-            associatedAlerts.addAll(parseAlertsFromSearchResponse(response))
+            val sdkSearchRequest = SearchDataObjectRequest.builder()
+                .indices(*searchRequest.indices())
+                .tenantId(currentTenantId())
+                .searchSourceBuilder(searchRequest.source())
+                .build()
+            val sdkResponse = sdkClient.searchDataObject(sdkSearchRequest)
+            val response = sdkResponse.searchResponse()
+            if (response != null) {
+                associatedAlerts.addAll(parseAlertsFromSearchResponse(response))
+            }
         } catch (e: Exception) {
             log.error("Failed to get associated alerts in get workflow alerts action", e)
         }

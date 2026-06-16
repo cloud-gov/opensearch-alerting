@@ -47,6 +47,11 @@ import org.opensearch.commons.alerting.model.InputRunResults
 import org.opensearch.commons.alerting.model.IntervalSchedule
 import org.opensearch.commons.alerting.model.Monitor
 import org.opensearch.commons.alerting.model.MonitorRunResult
+import org.opensearch.commons.alerting.model.PPLInput
+import org.opensearch.commons.alerting.model.PPLInput.QueryLanguage
+import org.opensearch.commons.alerting.model.PPLTrigger
+import org.opensearch.commons.alerting.model.PPLTrigger.ConditionType
+import org.opensearch.commons.alerting.model.PPLTrigger.NumResultsCondition
 import org.opensearch.commons.alerting.model.QueryLevelTrigger
 import org.opensearch.commons.alerting.model.QueryLevelTriggerRunResult
 import org.opensearch.commons.alerting.model.Schedule
@@ -79,9 +84,17 @@ import org.opensearch.search.builder.SearchSourceBuilder
 import org.opensearch.test.OpenSearchTestCase.randomBoolean
 import org.opensearch.test.OpenSearchTestCase.randomInt
 import org.opensearch.test.OpenSearchTestCase.randomIntBetween
+import org.opensearch.test.OpenSearchTestCase.randomLongBetween
 import org.opensearch.test.rest.OpenSearchRestTestCase
+import org.opensearch.test.rest.OpenSearchRestTestCase.assertEquals
 import java.time.Instant
 import java.time.temporal.ChronoUnit
+
+// constants for PPL Alerting tests
+const val TIMESTAMP_FIELD = "timestamp"
+const val TEST_INDEX_NAME = "index"
+const val TEST_INDEX_MAPPINGS =
+    """"properties":{"timestamp":{"type":"date"},"abc":{"type":"keyword"},"number":{"type":"integer"}}"""
 
 fun randomQueryLevelMonitor(
     name: String = OpenSearchRestTestCase.randomAlphaOfLength(10),
@@ -193,7 +206,7 @@ fun randomDocumentLevelMonitor(
     inputs: List<Input> = listOf(DocLevelMonitorInput("description", listOf("index"), emptyList())),
     schedule: Schedule = IntervalSchedule(interval = 5, unit = ChronoUnit.MINUTES),
     enabled: Boolean = randomBoolean(),
-    triggers: List<Trigger> = (1..randomInt(10)).map { randomQueryLevelTrigger() },
+    triggers: List<Trigger> = (1..randomInt(10)).map { randomDocumentLevelTrigger() },
     enabledTime: Instant? = if (enabled) Instant.now().truncatedTo(ChronoUnit.MILLIS) else null,
     lastUpdateTime: Instant = Instant.now().truncatedTo(ChronoUnit.MILLIS),
     withMetadata: Boolean = false
@@ -211,7 +224,7 @@ fun randomDocumentLevelMonitor(
     inputs: List<Input> = listOf(DocLevelMonitorInput("description", listOf("index"), emptyList())),
     schedule: Schedule = IntervalSchedule(interval = 5, unit = ChronoUnit.MINUTES),
     enabled: Boolean = randomBoolean(),
-    triggers: List<Trigger> = (1..randomInt(10)).map { randomQueryLevelTrigger() },
+    triggers: List<Trigger> = (1..randomInt(10)).map { randomDocumentLevelTrigger() },
     enabledTime: Instant? = if (enabled) Instant.now().truncatedTo(ChronoUnit.MILLIS) else null,
     lastUpdateTime: Instant = Instant.now().truncatedTo(ChronoUnit.MILLIS),
     withMetadata: Boolean = false,
@@ -224,6 +237,36 @@ fun randomDocumentLevelMonitor(
         schedule = schedule, triggers = triggers, enabledTime = enabledTime, lastUpdateTime = lastUpdateTime, user = user,
         uiMetadata = if (withMetadata) mapOf("foo" to "bar") else mapOf(), dataSources = dataSources,
         shouldCreateSingleAlertForFindings = ignoreFindingsAndAlerts, owner = owner
+    )
+}
+
+fun randomPPLMonitor(
+    name: String = OpenSearchRestTestCase.randomAlphaOfLength(10),
+    enabled: Boolean = randomBoolean(),
+    schedule: Schedule = IntervalSchedule(interval = 5, unit = ChronoUnit.MINUTES),
+    lastUpdateTime: Instant = Instant.now().truncatedTo(ChronoUnit.MILLIS),
+    enabledTime: Instant? = if (enabled) Instant.now().truncatedTo(ChronoUnit.MILLIS) else null,
+    triggers: List<PPLTrigger> = List(randomIntBetween(1, 5)) { randomPPLTrigger() },
+    user: User? = randomUser(),
+    queryLanguage: QueryLanguage = QueryLanguage.PPL,
+    query: String = "source = $TEST_INDEX_NAME | head 10"
+): Monitor {
+    return Monitor(
+        name = name,
+        enabled = enabled,
+        schedule = schedule,
+        lastUpdateTime = lastUpdateTime,
+        enabledTime = enabledTime,
+        monitorType = Monitor.MonitorType.PPL_MONITOR.value,
+        inputs = listOf(
+            PPLInput(
+                query = query,
+                queryLanguage = queryLanguage
+            )
+        ),
+        triggers = triggers,
+        user = user,
+        uiMetadata = mapOf()
     )
 }
 
@@ -348,6 +391,35 @@ fun randomDocumentLevelTrigger(
     )
 }
 
+// random PPLTrigger defaults to a number_of_results trigger, because a custom condition
+// would require knowledge of the PPL Monitor's query
+// it is on the caller to be explicit and pass in valid arguments that would create either
+// a valid PPL Monitor or one that intentionally throws an error during testing.
+// e.g. to create a valid PPL Monitor, if conditionType is CUSTOM,
+// numResultsCondition and numResultsValue must be null, while
+// customCondition must not be null.
+fun randomPPLTrigger(
+    id: String = UUIDs.base64UUID(),
+    name: String = OpenSearchRestTestCase.randomAlphaOfLength(10),
+    severity: String = "1",
+    actions: List<Action> = mutableListOf(),
+    conditionType: ConditionType = ConditionType.NUMBER_OF_RESULTS,
+    numResultsCondition: NumResultsCondition? = NumResultsCondition.entries.random(),
+    numResultsValue: Long? = randomLongBetween(1L, 50L),
+    customCondition: String? = null
+): PPLTrigger {
+    return PPLTrigger(
+        id = id,
+        name = name,
+        severity = severity,
+        actions = actions,
+        conditionType = conditionType,
+        numResultsCondition = numResultsCondition,
+        numResultsValue = numResultsValue,
+        customCondition = customCondition
+    )
+}
+
 fun randomBucketSelectorExtAggregationBuilder(
     name: String = OpenSearchRestTestCase.randomAlphaOfLength(10),
     bucketsPathsMap: MutableMap<String, String> = mutableMapOf("avg" to "10"),
@@ -424,10 +496,11 @@ fun randomTemplateScript(
 fun randomAction(
     name: String = OpenSearchRestTestCase.randomUnicodeOfLength(10),
     template: Script = randomTemplateScript("Hello World"),
-    destinationId: String = "",
+    subjectTemplate: Script = template,
+    destinationId: String = "abc",
     throttleEnabled: Boolean = false,
     throttle: Throttle = randomThrottle()
-) = Action(name, destinationId, template, template, throttleEnabled, throttle, actionExecutionPolicy = null)
+) = Action(name, destinationId, subjectTemplate, template, throttleEnabled, throttle, actionExecutionPolicy = null)
 
 fun randomActionWithPolicy(
     name: String = OpenSearchRestTestCase.randomUnicodeOfLength(10),
@@ -535,7 +608,7 @@ fun randomActionExecutionResult(
     throttledCount: Int = randomInt()
 ) = ActionExecutionResult(actionId, lastExecutionTime, throttledCount)
 
-fun randomQueryLevelMonitorRunResult(): MonitorRunResult<QueryLevelTriggerRunResult> {
+fun randomQueryLevelMonitorRunResult(results: List<Map<String, Any>> = listOf()): MonitorRunResult<QueryLevelTriggerRunResult> {
     val triggerResults = mutableMapOf<String, QueryLevelTriggerRunResult>()
     val triggerRunResult = randomQueryLevelTriggerRunResult()
     triggerResults.plus(Pair("test", triggerRunResult))
@@ -545,12 +618,12 @@ fun randomQueryLevelMonitorRunResult(): MonitorRunResult<QueryLevelTriggerRunRes
         Instant.now(),
         Instant.now(),
         null,
-        randomInputRunResults(),
+        randomInputRunResults(results),
         triggerResults
     )
 }
 
-fun randomBucketLevelMonitorRunResult(): MonitorRunResult<BucketLevelTriggerRunResult> {
+fun randomBucketLevelMonitorRunResult(results: List<Map<String, Any>> = listOf()): MonitorRunResult<BucketLevelTriggerRunResult> {
     val triggerResults = mutableMapOf<String, BucketLevelTriggerRunResult>()
     val triggerRunResult = randomBucketLevelTriggerRunResult()
     triggerResults.plus(Pair("test", triggerRunResult))
@@ -560,12 +633,12 @@ fun randomBucketLevelMonitorRunResult(): MonitorRunResult<BucketLevelTriggerRunR
         Instant.now(),
         Instant.now(),
         null,
-        randomInputRunResults(),
+        randomInputRunResults(results),
         triggerResults
     )
 }
 
-fun randomDocumentLevelMonitorRunResult(): MonitorRunResult<DocumentLevelTriggerRunResult> {
+fun randomDocumentLevelMonitorRunResult(results: List<Map<String, Any>> = listOf()): MonitorRunResult<DocumentLevelTriggerRunResult> {
     val triggerResults = mutableMapOf<String, DocumentLevelTriggerRunResult>()
     val triggerRunResult = randomDocumentLevelTriggerRunResult()
     triggerResults.plus(Pair("test", triggerRunResult))
@@ -575,13 +648,13 @@ fun randomDocumentLevelMonitorRunResult(): MonitorRunResult<DocumentLevelTrigger
         Instant.now(),
         Instant.now(),
         null,
-        randomInputRunResults(),
+        randomInputRunResults(results),
         triggerResults
     )
 }
 
-fun randomInputRunResults(): InputRunResults {
-    return InputRunResults(listOf(), null)
+fun randomInputRunResults(results: List<Map<String, Any>> = listOf()): InputRunResults {
+    return InputRunResults(results, null)
 }
 
 fun randomQueryLevelTriggerRunResult(): QueryLevelTriggerRunResult {
@@ -656,14 +729,14 @@ fun Alert.toJsonString(): String {
     return this.toXContent(builder, ToXContent.EMPTY_PARAMS).string()
 }
 
-fun randomUser(): User {
+fun randomUser(roles: List<String> = listOf(OpenSearchRestTestCase.randomAlphaOfLength(10), ALL_ACCESS_ROLE)): User {
     return User(
         OpenSearchRestTestCase.randomAlphaOfLength(10),
         listOf(
             OpenSearchRestTestCase.randomAlphaOfLength(10),
             OpenSearchRestTestCase.randomAlphaOfLength(10)
         ),
-        listOf(OpenSearchRestTestCase.randomAlphaOfLength(10), ALL_ACCESS_ROLE),
+        roles,
         mapOf("test_attr" to "test"),
     )
 }
@@ -809,4 +882,74 @@ fun randomAlertContext(
 /** helper that returns a field in a json map whose values are all json objects */
 fun Map<String, Any>.objectMap(key: String): Map<String, Map<String, Any>> {
     return this[key] as Map<String, Map<String, Any>>
+}
+
+fun assertPplMonitorsEqual(pplMonitor1: Monitor, pplMonitor2: Monitor) {
+    // note: Get and Search Monitor responses do not include User information by
+    // design, so that check is skipped
+
+    // note: Update Monitor API intentionally overrides the enabledTime of the new given monitor
+    // with the enabledTime of the existing monitor being updated to ensure execution correctness,
+    // so that check is skipped
+
+    assertEquals("Monitor enabled fields not equal", pplMonitor1.enabled, pplMonitor2.enabled)
+    assertEquals("Monitor schedules not equal", pplMonitor1.schedule, pplMonitor2.schedule)
+    assertEquals(
+        "Monitor query languages not equal",
+        (pplMonitor1.inputs[0] as PPLInput).queryLanguage,
+        (pplMonitor2.inputs[0] as PPLInput).queryLanguage
+    )
+    assertEquals(
+        "Monitor queries not equal",
+        (pplMonitor1.inputs[0] as PPLInput).query,
+        (pplMonitor2.inputs[0] as PPLInput).query
+    )
+    assertEquals("Number of triggers in monitor not equal", pplMonitor1.triggers.size, pplMonitor2.triggers.size)
+
+    val sortedTriggers1 = pplMonitor1.triggers.sortedBy { it.id }
+    val sortedTriggers2 = pplMonitor2.triggers.sortedBy { it.id }
+    for (i in sortedTriggers1.indices) {
+        assertPplTriggersEqual(sortedTriggers1[i] as PPLTrigger, sortedTriggers2[i] as PPLTrigger)
+    }
+}
+
+fun assertPplTriggersEqual(pplTrigger1: PPLTrigger, pplTrigger2: PPLTrigger) {
+    assertEquals(
+        "Monitor trigger IDs not equal",
+        pplTrigger1.id,
+        pplTrigger2.id
+    )
+
+    val id = pplTrigger1.id
+
+    assertEquals(
+        "Monitor trigger $id names not equal",
+        pplTrigger1.name,
+        pplTrigger2.name
+    )
+    assertEquals(
+        "Monitor trigger $id severities not equal",
+        pplTrigger1.severity,
+        pplTrigger2.severity
+    )
+    assertEquals(
+        "Monitor trigger $id condition types not equal",
+        pplTrigger1.conditionType,
+        pplTrigger2.conditionType
+    )
+    assertEquals(
+        "Monitor trigger $id number_of_results conditions not equal",
+        pplTrigger1.numResultsCondition,
+        pplTrigger2.numResultsCondition
+    )
+    assertEquals(
+        "Monitor trigger $id number_of_results values not equal",
+        pplTrigger1.numResultsValue,
+        pplTrigger2.numResultsValue
+    )
+    assertEquals(
+        "Monitor trigger $id custom conditions not equal",
+        pplTrigger1.customCondition,
+        pplTrigger2.customCondition
+    )
 }

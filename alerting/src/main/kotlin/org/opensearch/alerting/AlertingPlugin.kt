@@ -52,9 +52,17 @@ import org.opensearch.alerting.resthandler.RestSearchEmailAccountAction
 import org.opensearch.alerting.resthandler.RestSearchEmailGroupAction
 import org.opensearch.alerting.resthandler.RestSearchMonitorAction
 import org.opensearch.alerting.script.TriggerScript
+import org.opensearch.alerting.service.AssumeRoleCredentialsCache
 import org.opensearch.alerting.service.DeleteMonitorService
+import org.opensearch.alerting.service.ExternalSchedulerService
+import org.opensearch.alerting.service.MonitorJobPoller
 import org.opensearch.alerting.settings.AlertingSettings
 import org.opensearch.alerting.settings.AlertingSettings.Companion.DOC_LEVEL_MONITOR_SHARD_FETCH_SIZE
+import org.opensearch.alerting.settings.AlertingSettings.Companion.MULTI_TENANCY_ENABLED
+import org.opensearch.alerting.settings.AlertingSettings.Companion.REMOTE_METADATA_ENDPOINT
+import org.opensearch.alerting.settings.AlertingSettings.Companion.REMOTE_METADATA_REGION
+import org.opensearch.alerting.settings.AlertingSettings.Companion.REMOTE_METADATA_SERVICE_NAME
+import org.opensearch.alerting.settings.AlertingSettings.Companion.REMOTE_METADATA_STORE_TYPE
 import org.opensearch.alerting.settings.DestinationSettings
 import org.opensearch.alerting.settings.LegacyOpenDistroAlertingSettings
 import org.opensearch.alerting.settings.LegacyOpenDistroDestinationSettings
@@ -84,6 +92,7 @@ import org.opensearch.alerting.transport.TransportSearchEmailAccountAction
 import org.opensearch.alerting.transport.TransportSearchEmailGroupAction
 import org.opensearch.alerting.transport.TransportSearchMonitorAction
 import org.opensearch.alerting.util.DocLevelMonitorQueries
+import org.opensearch.alerting.util.MustacheTemplateService
 import org.opensearch.alerting.util.destinationmigration.DestinationMigrationCoordinator
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver
 import org.opensearch.cluster.node.DiscoveryNodes
@@ -103,12 +112,15 @@ import org.opensearch.commons.alerting.model.ClusterMetricsInput
 import org.opensearch.commons.alerting.model.DocLevelMonitorInput
 import org.opensearch.commons.alerting.model.DocumentLevelTrigger
 import org.opensearch.commons.alerting.model.Monitor
+import org.opensearch.commons.alerting.model.PPLInput
+import org.opensearch.commons.alerting.model.PPLTrigger
 import org.opensearch.commons.alerting.model.QueryLevelTrigger
 import org.opensearch.commons.alerting.model.ScheduledJob
 import org.opensearch.commons.alerting.model.ScheduledJob.Companion.SCHEDULED_JOBS_INDEX
 import org.opensearch.commons.alerting.model.SearchInput
 import org.opensearch.commons.alerting.model.Workflow
 import org.opensearch.commons.alerting.model.remote.monitors.RemoteMonitorTrigger
+import org.opensearch.commons.utils.scheduler.JobQueueAccountIdProvider
 import org.opensearch.core.action.ActionResponse
 import org.opensearch.core.common.io.stream.NamedWriteableRegistry
 import org.opensearch.core.common.io.stream.StreamInput
@@ -129,6 +141,13 @@ import org.opensearch.plugins.ReloadablePlugin
 import org.opensearch.plugins.ScriptPlugin
 import org.opensearch.plugins.SearchPlugin
 import org.opensearch.plugins.SystemIndexPlugin
+import org.opensearch.remote.metadata.client.SdkClient
+import org.opensearch.remote.metadata.client.impl.SdkClientFactory
+import org.opensearch.remote.metadata.common.CommonValue.REMOTE_METADATA_ENDPOINT_KEY
+import org.opensearch.remote.metadata.common.CommonValue.REMOTE_METADATA_REGION_KEY
+import org.opensearch.remote.metadata.common.CommonValue.REMOTE_METADATA_SERVICE_NAME_KEY
+import org.opensearch.remote.metadata.common.CommonValue.REMOTE_METADATA_TYPE_KEY
+import org.opensearch.remote.metadata.common.CommonValue.TENANT_AWARE_KEY
 import org.opensearch.repositories.RepositoriesService
 import org.opensearch.rest.RestController
 import org.opensearch.rest.RestHandler
@@ -156,6 +175,8 @@ internal class AlertingPlugin : PainlessExtension, ActionPlugin, ScriptPlugin, R
     companion object {
         @JvmField val OPEN_SEARCH_DASHBOARDS_USER_AGENT = "OpenSearch-Dashboards"
         @JvmField val UI_METADATA_EXCLUDE = arrayOf("monitor.${Monitor.UI_METADATA_FIELD}")
+        @JvmField val TENANT_ID_HEADER = "x-tenant-id"
+        @JvmField val TENANT_ID_METADATA_KEY = "tenant_id"
         @JvmField val MONITOR_BASE_URI = "/_plugins/_alerting/monitors"
         @JvmField val WORKFLOW_BASE_URI = "/_plugins/_alerting/workflows"
         @JvmField val REMOTE_BASE_URI = "/_plugins/_alerting/remote"
@@ -258,12 +279,14 @@ internal class AlertingPlugin : PainlessExtension, ActionPlugin, ScriptPlugin, R
             Monitor.XCONTENT_REGISTRY,
             SearchInput.XCONTENT_REGISTRY,
             DocLevelMonitorInput.XCONTENT_REGISTRY,
+            PPLInput.XCONTENT_REGISTRY,
             QueryLevelTrigger.XCONTENT_REGISTRY,
             BucketLevelTrigger.XCONTENT_REGISTRY,
             ClusterMetricsInput.XCONTENT_REGISTRY,
             DocumentLevelTrigger.XCONTENT_REGISTRY,
             ChainedAlertTrigger.XCONTENT_REGISTRY,
             RemoteMonitorTrigger.XCONTENT_REGISTRY,
+            PPLTrigger.XCONTENT_REGISTRY,
             Workflow.XCONTENT_REGISTRY
         )
     }
@@ -285,7 +308,21 @@ internal class AlertingPlugin : PainlessExtension, ActionPlugin, ScriptPlugin, R
         val settings = environment.settings()
         val lockService = LockService(client, clusterService)
         alertIndices = AlertIndices(settings, client, threadPool, clusterService)
-        val alertService = AlertService(client, xContentRegistry, alertIndices)
+
+        val sdkClient: SdkClient = SdkClientFactory.createSdkClient(
+            client,
+            xContentRegistry,
+            mapOf(
+                REMOTE_METADATA_TYPE_KEY to REMOTE_METADATA_STORE_TYPE.get(settings),
+                REMOTE_METADATA_ENDPOINT_KEY to REMOTE_METADATA_ENDPOINT.get(settings),
+                REMOTE_METADATA_REGION_KEY to REMOTE_METADATA_REGION.get(settings),
+                REMOTE_METADATA_SERVICE_NAME_KEY to REMOTE_METADATA_SERVICE_NAME.get(settings),
+                TENANT_AWARE_KEY to MULTI_TENANCY_ENABLED.get(settings).toString()
+            ),
+            client.threadPool().executor(ThreadPool.Names.GENERIC)
+        )
+
+        val alertService = AlertService(client, xContentRegistry, alertIndices, sdkClient)
         val triggerService = TriggerService(scriptService)
         runner = MonitorRunnerService
             .registerClusterService(clusterService)
@@ -309,6 +346,7 @@ internal class AlertingPlugin : PainlessExtension, ActionPlugin, ScriptPlugin, R
             )
             .registerTriggerService(triggerService)
             .registerAlertService(alertService)
+            .registerMustacheTemplateService(MustacheTemplateService(scriptService, settings))
             .registerDocLevelMonitorQueries(DocLevelMonitorQueries(client, clusterService))
             .registerJvmStats(JvmStats.jvmStats())
             .registerWorkflowService(WorkflowService(client, xContentRegistry))
@@ -329,7 +367,8 @@ internal class AlertingPlugin : PainlessExtension, ActionPlugin, ScriptPlugin, R
             client,
             clusterService,
             xContentRegistry,
-            settings
+            settings,
+            sdkClient
         )
 
         WorkflowMetadataService.initialize(
@@ -339,7 +378,36 @@ internal class AlertingPlugin : PainlessExtension, ActionPlugin, ScriptPlugin, R
             settings
         )
 
-        DeleteMonitorService.initialize(client, lockService)
+        DeleteMonitorService.initialize(client, lockService, sdkClient)
+
+        val providerType = AlertingSettings.JOB_QUEUE_ACCOUNT_PROVIDER_TYPE.get(settings)
+        val monitorJobPoller = MonitorJobPoller(
+            xContentRegistry,
+            client,
+            MULTI_TENANCY_ENABLED.get(settings),
+            if (providerType.isNotEmpty()) JobQueueAccountIdProvider.find(providerType, settings) else null,
+            REMOTE_METADATA_REGION.get(settings) ?: "",
+            AlertingSettings.JOB_QUEUE_NAME.get(settings) ?: "",
+            AlertingSettings.TARGET_TYPE_TO_SERVICE_NAME.get(settings).let {
+                it.keySet().associateWith { key -> it.get(key) }
+            },
+            AlertingSettings.TENANT_ACCOUNT_ID_HEADER.get(settings) ?: "",
+            AlertingSettings.TENANT_RESOURCE_ID_HEADER.get(settings).let {
+                it.keySet().associateWith { key -> it.get(key) }
+            }
+        )
+
+        ExternalSchedulerService.initialize(settings)
+        if (AlertingSettings.EXTERNAL_SCHEDULER_ENABLED.get(settings)) {
+            val region = REMOTE_METADATA_REGION.get(settings)
+            val roleName = AlertingSettings.EXTERNAL_SCHEDULER_ROLE_NAME.get(settings)
+            if (!region.isNullOrBlank() && roleName.isNotBlank()) {
+                ExternalSchedulerService.credentialsCache = AssumeRoleCredentialsCache(
+                    region,
+                    "arn:aws:iam::%s:role/$roleName"
+                )
+            }
+        }
 
         return listOf(
             sweeper,
@@ -351,7 +419,9 @@ internal class AlertingPlugin : PainlessExtension, ActionPlugin, ScriptPlugin, R
             destinationMigrationCoordinator,
             lockService,
             alertService,
-            triggerService
+            triggerService,
+            sdkClient,
+            monitorJobPoller
         )
     }
 
@@ -382,6 +452,7 @@ internal class AlertingPlugin : PainlessExtension, ActionPlugin, ScriptPlugin, R
             AlertingSettings.ALERT_HISTORY_MAX_DOCS,
             AlertingSettings.ALERT_HISTORY_RETENTION_PERIOD,
             AlertingSettings.ALERTING_MAX_MONITORS,
+            AlertingSettings.MAX_TRIGGERS_PER_MONITOR,
             AlertingSettings.PERCOLATE_QUERY_DOCS_SIZE_MEMORY_PERCENTAGE_LIMIT,
             AlertingSettings.DOC_LEVEL_MONITOR_FAN_OUT_NODES,
             DOC_LEVEL_MONITOR_SHARD_FETCH_SIZE,
@@ -431,7 +502,32 @@ internal class AlertingPlugin : PainlessExtension, ActionPlugin, ScriptPlugin, R
             AlertingSettings.COMMENTS_HISTORY_RETENTION_PERIOD,
             AlertingSettings.COMMENTS_MAX_CONTENT_SIZE,
             AlertingSettings.MAX_COMMENTS_PER_ALERT,
-            AlertingSettings.MAX_COMMENTS_PER_NOTIFICATION
+            AlertingSettings.MAX_COMMENTS_PER_NOTIFICATION,
+            AlertingSettings.NOTIFICATION_CONTEXT_RESULTS_ALLOWED_ROLES,
+            AlertingSettings.MULTI_TENANCY_ENABLED,
+            AlertingSettings.REMOTE_METADATA_STORE_TYPE,
+            AlertingSettings.REMOTE_METADATA_ENDPOINT,
+            AlertingSettings.REMOTE_METADATA_REGION,
+            AlertingSettings.REMOTE_METADATA_SERVICE_NAME,
+            AlertingSettings.MAX_PPL_TRIGGERS_PER_MONITOR,
+            AlertingSettings.PPL_QUERY_EXECUTION_MAX_DURATION,
+            AlertingSettings.PPL_MAX_QUERY_LENGTH,
+            AlertingSettings.PPL_QUERY_RESULTS_MAX_DATAROWS,
+            AlertingSettings.PPL_QUERY_RESULTS_MAX_SIZE,
+            AlertingSettings.NOTIFICATION_SUBJECT_SOURCE_MAX_LENGTH,
+            AlertingSettings.NOTIFICATION_MESSAGE_SOURCE_MAX_LENGTH,
+            AlertingSettings.MULTI_TENANT_TRIGGER_EVAL_ENABLED,
+            AlertingSettings.EXTERNAL_SCHEDULER_ENABLED,
+            AlertingSettings.EXTERNAL_SCHEDULER_ACCOUNT_ID,
+            AlertingSettings.JOB_QUEUE_NAME,
+            AlertingSettings.JOB_QUEUE_MESSAGE_GROUP_KEY_NAME,
+            AlertingSettings.EXTERNAL_SCHEDULER_ROLE_NAME,
+            AlertingSettings.EXTERNAL_SCHEDULER_EXECUTION_ROLE_NAME,
+            AlertingSettings.JOB_QUEUE_ACCOUNT_ID,
+            AlertingSettings.JOB_QUEUE_ACCOUNT_PROVIDER_TYPE,
+            AlertingSettings.TARGET_TYPE_TO_SERVICE_NAME,
+            AlertingSettings.TENANT_ACCOUNT_ID_HEADER,
+            AlertingSettings.TENANT_RESOURCE_ID_HEADER
         )
     }
 

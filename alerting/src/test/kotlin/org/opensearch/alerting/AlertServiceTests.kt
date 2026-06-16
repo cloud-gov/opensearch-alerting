@@ -5,6 +5,7 @@
 
 package org.opensearch.alerting
 
+import kotlinx.coroutines.runBlocking
 import org.junit.Before
 import org.mockito.Mockito
 import org.opensearch.Version
@@ -22,13 +23,13 @@ import org.opensearch.commons.alerting.model.BucketLevelTrigger
 import org.opensearch.commons.alerting.model.Monitor
 import org.opensearch.commons.alerting.model.action.AlertCategory
 import org.opensearch.core.xcontent.NamedXContentRegistry
+import org.opensearch.remote.metadata.client.SdkClient
 import org.opensearch.test.ClusterServiceUtils
 import org.opensearch.test.OpenSearchTestCase
 import org.opensearch.threadpool.ThreadPool
 import org.opensearch.transport.client.Client
 import java.time.Instant
 import java.time.temporal.ChronoUnit
-
 class AlertServiceTests : OpenSearchTestCase() {
 
     private lateinit var client: Client
@@ -67,7 +68,7 @@ class AlertServiceTests : OpenSearchTestCase() {
         clusterService = Mockito.spy(testClusterService)
 
         alertIndices = AlertIndices(settings, client, threadPool, clusterService)
-        alertService = AlertService(client, xContentRegistry, alertIndices)
+        alertService = AlertService(client, xContentRegistry, alertIndices, Mockito.mock(SdkClient::class.java))
     }
 
     fun `test getting categorized alerts for bucket-level monitor with no current alerts`() {
@@ -213,6 +214,32 @@ class AlertServiceTests : OpenSearchTestCase() {
         assertAlertsExistForBucketKeys(listOf(listOf("a")), categorizedAlerts[AlertCategory.DEDUPED] ?: error("Deduped alerts not found"))
         assertAlertsExistForBucketKeys(emptyList(), categorizedAlerts[AlertCategory.NEW] ?: error("New alerts found"))
         assertAlertsExistForBucketKeys(emptyList(), completedAlerts)
+    }
+
+    fun `test loadCurrentAlertsForQueryLevelMonitor returns empty alerts for dry-run monitor with blank id`() {
+        val trigger = randomQueryLevelTrigger()
+        val monitor = randomQueryLevelMonitor(triggers = listOf(trigger)).copy(id = Monitor.NO_ID)
+
+        val result = runBlocking {
+            alertService.loadCurrentAlertsForQueryLevelMonitor(monitor, null)
+        }
+
+        assertEquals(1, result.size)
+        assertTrue(result.containsKey(trigger))
+        assertNull(result[trigger])
+    }
+
+    fun `test loadCurrentAlertsForBucketLevelMonitor returns empty alerts for dry-run monitor with blank id`() {
+        val trigger = randomBucketLevelTrigger()
+        val monitor = randomBucketLevelMonitor(triggers = listOf(trigger)).copy(id = Monitor.NO_ID)
+
+        val result = runBlocking {
+            alertService.loadCurrentAlertsForBucketLevelMonitor(monitor, null)
+        }
+
+        assertEquals(1, result.size)
+        assertTrue(result.containsKey(trigger))
+        assertTrue(result[trigger]!!.isEmpty())
     }
 
     private fun createCurrentAlertsFromBucketKeys(

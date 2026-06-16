@@ -24,6 +24,7 @@ import org.opensearch.action.support.ActionFilters
 import org.opensearch.action.support.HandledTransportAction
 import org.opensearch.action.support.WriteRequest
 import org.opensearch.action.update.UpdateRequest
+import org.opensearch.alerting.AlertingPlugin
 import org.opensearch.alerting.opensearchapi.suspendUntil
 import org.opensearch.alerting.settings.AlertingSettings
 import org.opensearch.alerting.util.ScheduledJobUtils
@@ -45,6 +46,7 @@ import org.opensearch.commons.alerting.model.ScheduledJob
 import org.opensearch.commons.alerting.model.Workflow
 import org.opensearch.commons.alerting.util.AlertingException
 import org.opensearch.commons.alerting.util.optionalTimeField
+import org.opensearch.commons.utils.TenantContext
 import org.opensearch.commons.utils.recreateObject
 import org.opensearch.core.action.ActionListener
 import org.opensearch.core.rest.RestStatus
@@ -52,6 +54,7 @@ import org.opensearch.core.xcontent.NamedXContentRegistry
 import org.opensearch.core.xcontent.XContentParser
 import org.opensearch.core.xcontent.XContentParserUtils
 import org.opensearch.index.query.QueryBuilders
+import org.opensearch.remote.metadata.client.SdkClient
 import org.opensearch.search.builder.SearchSourceBuilder
 import org.opensearch.tasks.Task
 import org.opensearch.transport.TransportService
@@ -69,6 +72,7 @@ class TransportAcknowledgeChainedAlertAction @Inject constructor(
     actionFilters: ActionFilters,
     val settings: Settings,
     val xContentRegistry: NamedXContentRegistry,
+    val sdkClient: SdkClient,
 ) : HandledTransportAction<ActionRequest, AcknowledgeAlertResponse>(
     AlertingActions.ACKNOWLEDGE_CHAINED_ALERTS_ACTION_NAME,
     transportService,
@@ -77,6 +81,8 @@ class TransportAcknowledgeChainedAlertAction @Inject constructor(
 ) {
     @Volatile
     private var isAlertHistoryEnabled = AlertingSettings.ALERT_HISTORY_ENABLED.get(settings)
+
+    private val multiTenancyEnabled = AlertingSettings.MULTI_TENANCY_ENABLED.get(settings)
 
     init {
         clusterService.clusterSettings.addSettingsUpdateConsumer(AlertingSettings.ALERT_HISTORY_ENABLED) { isAlertHistoryEnabled = it }
@@ -87,10 +93,23 @@ class TransportAcknowledgeChainedAlertAction @Inject constructor(
         AcknowledgeChainedAlertRequest: ActionRequest,
         actionListener: ActionListener<AcknowledgeAlertResponse>,
     ) {
+        if (multiTenancyEnabled) {
+            actionListener.onFailure(
+                AlertingException.wrap(
+                    OpenSearchStatusException(
+                        "Chained alert operations are not allowed when multi-tenancy is enabled.",
+                        RestStatus.METHOD_NOT_ALLOWED
+                    )
+                )
+            )
+            return
+        }
+
         val request = AcknowledgeChainedAlertRequest as? AcknowledgeChainedAlertRequest
             ?: recreateObject(AcknowledgeChainedAlertRequest) { AcknowledgeChainedAlertRequest(it) }
+        val tenantId = client.threadPool().threadContext.getHeader(AlertingPlugin.TENANT_ID_HEADER)
         client.threadPool().threadContext.stashContext().use {
-            scope.launch {
+            scope.launch(TenantContext(tenantId)) {
                 try {
                     val getResponse = getWorkflow(request.workflowId)
                     if (getResponse.isExists == false) {

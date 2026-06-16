@@ -10,15 +10,11 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import org.apache.logging.log4j.LogManager
 import org.opensearch.action.ActionRequest
-import org.opensearch.action.get.GetRequest
-import org.opensearch.action.get.GetResponse
-import org.opensearch.action.search.SearchRequest
-import org.opensearch.action.search.SearchResponse
 import org.opensearch.action.support.ActionFilters
 import org.opensearch.action.support.HandledTransportAction
+import org.opensearch.alerting.AlertingPlugin
 import org.opensearch.alerting.alerts.AlertIndices
 import org.opensearch.alerting.opensearchapi.addFilter
-import org.opensearch.alerting.opensearchapi.suspendUntil
 import org.opensearch.alerting.settings.AlertingSettings
 import org.opensearch.alerting.util.use
 import org.opensearch.cluster.service.ClusterService
@@ -31,10 +27,14 @@ import org.opensearch.commons.alerting.action.AlertingActions
 import org.opensearch.commons.alerting.action.GetAlertsRequest
 import org.opensearch.commons.alerting.action.GetAlertsResponse
 import org.opensearch.commons.alerting.model.Alert
+import org.opensearch.commons.alerting.model.Alert.Companion.MONITOR_NAME_FIELD
+import org.opensearch.commons.alerting.model.Alert.Companion.TRIGGER_NAME_FIELD
 import org.opensearch.commons.alerting.model.Monitor
 import org.opensearch.commons.alerting.model.ScheduledJob
 import org.opensearch.commons.alerting.util.AlertingException
 import org.opensearch.commons.authuser.User
+import org.opensearch.commons.utils.TenantContext
+import org.opensearch.commons.utils.currentTenantId
 import org.opensearch.commons.utils.recreateObject
 import org.opensearch.core.action.ActionListener
 import org.opensearch.core.common.io.stream.NamedWriteableRegistry
@@ -44,6 +44,10 @@ import org.opensearch.core.xcontent.XContentParserUtils
 import org.opensearch.index.query.BoolQueryBuilder
 import org.opensearch.index.query.Operator
 import org.opensearch.index.query.QueryBuilders
+import org.opensearch.remote.metadata.client.GetDataObjectRequest
+import org.opensearch.remote.metadata.client.SdkClient
+import org.opensearch.remote.metadata.client.SearchDataObjectRequest
+import org.opensearch.remote.metadata.common.SdkClientUtils
 import org.opensearch.search.builder.SearchSourceBuilder
 import org.opensearch.search.sort.SortBuilders
 import org.opensearch.search.sort.SortOrder
@@ -62,7 +66,8 @@ class TransportGetAlertsAction @Inject constructor(
     actionFilters: ActionFilters,
     val settings: Settings,
     val xContentRegistry: NamedXContentRegistry,
-    val namedWriteableRegistry: NamedWriteableRegistry
+    val namedWriteableRegistry: NamedWriteableRegistry,
+    val sdkClient: SdkClient
 ) : HandledTransportAction<ActionRequest, GetAlertsResponse>(
     AlertingActions.GET_ALERTS_ACTION_NAME,
     transportService,
@@ -135,8 +140,8 @@ class TransportGetAlertsAction @Inject constructor(
                     QueryBuilders
                         .queryStringQuery(tableProp.searchString)
                         .defaultOperator(Operator.AND)
-                        .field("monitor_name")
-                        .field("trigger_name")
+                        .field(MONITOR_NAME_FIELD)
+                        .field(TRIGGER_NAME_FIELD)
                 )
         }
         val searchSourceBuilder = SearchSourceBuilder()
@@ -147,11 +152,12 @@ class TransportGetAlertsAction @Inject constructor(
             .size(tableProp.size)
             .from(tableProp.startIndex)
 
+        val tenantId = client.threadPool().threadContext.getHeader(AlertingPlugin.TENANT_ID_HEADER)
         client.threadPool().threadContext.stashContext().use {
-            scope.launch {
+            scope.launch(TenantContext(tenantId)) {
                 try {
                     val alertIndex = resolveAlertsIndexName(getAlertsRequest)
-                    getAlerts(alertIndex, searchSourceBuilder, actionListener, user)
+                    getAlerts(alertIndex, searchSourceBuilder, actionListener, user, tenantId)
                 } catch (t: Exception) {
                     log.error("Failed to get alerts", t)
                     if (t is AlertingException) {
@@ -201,10 +207,16 @@ class TransportGetAlertsAction @Inject constructor(
     }
 
     private suspend fun getMonitor(getAlertsRequest: GetAlertsRequest): Monitor? {
-        val getRequest = GetRequest(ScheduledJob.SCHEDULED_JOBS_INDEX, getAlertsRequest.monitorId!!)
+        val tenantId = currentTenantId()
+        val getRequest = GetDataObjectRequest.builder()
+            .index(ScheduledJob.SCHEDULED_JOBS_INDEX)
+            .id(getAlertsRequest.monitorId!!)
+            .tenantId(tenantId)
+            .build()
         try {
-            val getResponse: GetResponse = client.suspendUntil { client.get(getRequest, it) }
-            if (!getResponse.isExists) {
+            val response = sdkClient.getDataObject(getRequest)
+            val getResponse = response.getResponse()
+            if (getResponse == null || !getResponse.isExists) {
                 return null
             }
             val xcp = XContentHelper.createParser(
@@ -223,54 +235,66 @@ class TransportGetAlertsAction @Inject constructor(
         searchSourceBuilder: SearchSourceBuilder,
         actionListener: ActionListener<GetAlertsResponse>,
         user: User?,
+        tenantId: String? = null,
     ) {
         // user is null when: 1/ security is disabled. 2/when user is super-admin.
         if (user == null) {
             // user is null when: 1/ security is disabled. 2/when user is super-admin.
-            search(alertIndex, searchSourceBuilder, actionListener)
+            search(alertIndex, searchSourceBuilder, actionListener, tenantId)
         } else if (!doFilterForUser(user)) {
             // security is enabled and filterby is disabled.
-            search(alertIndex, searchSourceBuilder, actionListener)
+            search(alertIndex, searchSourceBuilder, actionListener, tenantId)
         } else {
             // security is enabled and filterby is enabled.
             try {
                 log.info("Filtering result by: ${user.backendRoles}")
                 addFilter(user, searchSourceBuilder, "monitor_user.backend_roles.keyword")
-                search(alertIndex, searchSourceBuilder, actionListener)
+                search(alertIndex, searchSourceBuilder, actionListener, tenantId)
             } catch (ex: IOException) {
                 actionListener.onFailure(AlertingException.wrap(ex))
             }
         }
     }
 
-    fun search(alertIndex: String, searchSourceBuilder: SearchSourceBuilder, actionListener: ActionListener<GetAlertsResponse>) {
-        val searchRequest = SearchRequest()
+    fun search(
+        alertIndex: String,
+        searchSourceBuilder: SearchSourceBuilder,
+        actionListener: ActionListener<GetAlertsResponse>,
+        tenantId: String? = null,
+    ) {
+        val sdkSearchRequest = SearchDataObjectRequest.builder()
             .indices(alertIndex)
-            .source(searchSourceBuilder)
+            .tenantId(tenantId)
+            .searchSourceBuilder(searchSourceBuilder)
+            .build()
 
-        client.search(
-            searchRequest,
-            object : ActionListener<SearchResponse> {
-                override fun onResponse(response: SearchResponse) {
-                    val totalAlertCount = response.hits.totalHits?.value?.toInt()
-                    val alerts = response.hits.map { hit ->
-                        val xcp = XContentHelper.createParser(
-                            xContentRegistry,
-                            LoggingDeprecationHandler.INSTANCE,
-                            hit.sourceRef,
-                            XContentType.JSON
-                        )
-                        XContentParserUtils.ensureExpectedToken(XContentParser.Token.START_OBJECT, xcp.nextToken(), xcp)
-                        val alert = Alert.parse(xcp, hit.id, hit.version)
-                        alert
-                    }
-                    actionListener.onResponse(GetAlertsResponse(alerts, totalAlertCount))
-                }
-
-                override fun onFailure(t: Exception) {
-                    actionListener.onFailure(t)
-                }
+        sdkClient.searchDataObjectAsync(sdkSearchRequest).whenComplete { response, throwable ->
+            if (throwable != null) {
+                actionListener.onFailure(SdkClientUtils.unwrapAndConvertToException(throwable))
+                return@whenComplete
             }
-        )
+            try {
+                val searchResponse = response.searchResponse()
+                if (searchResponse == null) {
+                    actionListener.onResponse(GetAlertsResponse(emptyList(), 0))
+                    return@whenComplete
+                }
+                val totalAlertCount = searchResponse.hits.totalHits?.value?.toInt()
+                val alerts = searchResponse.hits.map { hit ->
+                    val xcp = XContentHelper.createParser(
+                        xContentRegistry,
+                        LoggingDeprecationHandler.INSTANCE,
+                        hit.sourceRef,
+                        XContentType.JSON
+                    )
+                    XContentParserUtils.ensureExpectedToken(XContentParser.Token.START_OBJECT, xcp.nextToken(), xcp)
+                    Alert.parse(xcp, hit.id, hit.version)
+                }
+                actionListener.onResponse(GetAlertsResponse(alerts, totalAlertCount))
+            } catch (e: Exception) {
+                log.error("Failed to search alerts", e)
+                actionListener.onFailure(AlertingException.wrap(e))
+            }
+        }
     }
 }

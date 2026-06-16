@@ -8,7 +8,12 @@ package org.opensearch.alerting
 import org.junit.Before
 import org.mockito.Mockito
 import org.opensearch.alerting.script.BucketLevelTriggerExecutionContext
+import org.opensearch.alerting.settings.AlertingSettings
+import org.opensearch.common.settings.ClusterSettings
+import org.opensearch.common.settings.Setting
+import org.opensearch.common.settings.Settings
 import org.opensearch.common.xcontent.XContentType
+import org.opensearch.commons.alerting.aggregation.bucketselectorext.BucketSelectorExtAggregationBuilder
 import org.opensearch.commons.alerting.model.BucketLevelTriggerRunResult
 import org.opensearch.commons.alerting.model.InputRunResults
 import org.opensearch.commons.alerting.model.MonitorRunResult
@@ -21,11 +26,16 @@ import java.time.Instant
 class TriggerServiceTests : OpenSearchTestCase() {
     private lateinit var scriptService: ScriptService
     private lateinit var triggerService: TriggerService
+    private lateinit var clusterSettings: ClusterSettings
 
     @Before
     fun setup() {
         scriptService = Mockito.mock(ScriptService::class.java)
         triggerService = TriggerService(scriptService)
+        val settings = Settings.builder().build()
+        val settingSet = hashSetOf<Setting<*>>()
+        settingSet.add(AlertingSettings.NOTIFICATION_CONTEXT_RESULTS_ALLOWED_ROLES)
+        clusterSettings = ClusterSettings(settings, settingSet)
     }
 
     fun `test run bucket level trigger with bucket key as int`() {
@@ -111,7 +121,7 @@ class TriggerServiceTests : OpenSearchTestCase() {
 
         var monitorRunResult = MonitorRunResult<BucketLevelTriggerRunResult>(monitor.name, Instant.now(), Instant.now())
         monitorRunResult = monitorRunResult.copy(inputResults = InputRunResults(listOf(inputResults)))
-        val triggerCtx = BucketLevelTriggerExecutionContext(monitor, trigger, monitorRunResult)
+        val triggerCtx = BucketLevelTriggerExecutionContext(monitor, trigger, monitorRunResult, clusterSettings = clusterSettings)
 
         val bucketLevelTriggerRunResult = triggerService.runBucketLevelTrigger(monitor, trigger, triggerCtx)
         assertNull(bucketLevelTriggerRunResult.error)
@@ -252,9 +262,203 @@ class TriggerServiceTests : OpenSearchTestCase() {
 
         var monitorRunResult = MonitorRunResult<BucketLevelTriggerRunResult>(monitor.name, Instant.now(), Instant.now())
         monitorRunResult = monitorRunResult.copy(inputResults = InputRunResults(listOf(inputResults)))
-        val triggerCtx = BucketLevelTriggerExecutionContext(monitor, trigger, monitorRunResult)
+        val triggerCtx = BucketLevelTriggerExecutionContext(monitor, trigger, monitorRunResult, clusterSettings = clusterSettings)
 
         val bucketLevelTriggerRunResult = triggerService.runBucketLevelTrigger(monitor, trigger, triggerCtx)
         assertNull(bucketLevelTriggerRunResult.error)
+    }
+
+    fun `test run bucket level trigger from filtered response with string keys`() {
+        val bucketSelectorExtAggregationBuilder = BucketSelectorExtAggregationBuilder(
+            "test_trigger",
+            mutableMapOf("_count" to "_count"),
+            randomScript(source = "params._count > 1"),
+            "status_code",
+            null
+        )
+        val trigger = randomBucketLevelTrigger(bucketSelector = bucketSelectorExtAggregationBuilder)
+        val monitor = randomBucketLevelMonitor(triggers = listOf(trigger))
+
+        // Standard bucket_selector already removed non-matching buckets.
+        // Only buckets with doc_count > 1 remain.
+        val inputResultsStr = """
+        {
+          "hits": { "hits": [], "total": { "value": 4, "relation": "eq" }, "max_score": null },
+          "took": 10, "timed_out": false,
+          "aggregations": {
+            "status_code": {
+              "buckets": [
+                { "doc_count": 2, "key": "200" },
+                { "doc_count": 3, "key": "500" }
+              ]
+            }
+          }
+        }
+        """.trimIndent()
+
+        val inputResults = parseInputResults(inputResultsStr)
+        var monitorRunResult = MonitorRunResult<BucketLevelTriggerRunResult>(monitor.name, Instant.now(), Instant.now())
+        monitorRunResult = monitorRunResult.copy(inputResults = InputRunResults(listOf(inputResults)))
+        val triggerCtx = BucketLevelTriggerExecutionContext(monitor, trigger, monitorRunResult, clusterSettings = clusterSettings)
+
+        val result = triggerService.runBucketLevelTriggerFromFilteredResponse(monitor, trigger, triggerCtx)
+        assertNull(result.error)
+        assertEquals(2, result.aggregationResultBuckets.size)
+        assertTrue(result.aggregationResultBuckets.containsKey("200"))
+        assertTrue(result.aggregationResultBuckets.containsKey("500"))
+    }
+
+    fun `test run bucket level trigger from filtered response with int keys`() {
+        val bucketSelectorExtAggregationBuilder = BucketSelectorExtAggregationBuilder(
+            "test_trigger",
+            mutableMapOf("_count" to "_count"),
+            randomScript(source = "params._count > 0"),
+            "status_code",
+            null
+        )
+        val trigger = randomBucketLevelTrigger(bucketSelector = bucketSelectorExtAggregationBuilder)
+        val monitor = randomBucketLevelMonitor(triggers = listOf(trigger))
+
+        val inputResultsStr = """
+        {
+          "hits": { "hits": [], "total": { "value": 3, "relation": "eq" }, "max_score": null },
+          "took": 10, "timed_out": false,
+          "aggregations": {
+            "status_code": {
+              "buckets": [
+                { "doc_count": 2, "key": 100 },
+                { "doc_count": 1, "key": 201 }
+              ]
+            }
+          }
+        }
+        """.trimIndent()
+
+        val inputResults = parseInputResults(inputResultsStr)
+        var monitorRunResult = MonitorRunResult<BucketLevelTriggerRunResult>(monitor.name, Instant.now(), Instant.now())
+        monitorRunResult = monitorRunResult.copy(inputResults = InputRunResults(listOf(inputResults)))
+        val triggerCtx = BucketLevelTriggerExecutionContext(monitor, trigger, monitorRunResult, clusterSettings = clusterSettings)
+
+        val result = triggerService.runBucketLevelTriggerFromFilteredResponse(monitor, trigger, triggerCtx)
+        assertNull(result.error)
+        assertEquals(2, result.aggregationResultBuckets.size)
+        assertTrue(result.aggregationResultBuckets.containsKey("100"))
+        assertTrue(result.aggregationResultBuckets.containsKey("201"))
+    }
+
+    fun `test run bucket level trigger from filtered response with composite map keys`() {
+        val bucketSelectorExtAggregationBuilder = BucketSelectorExtAggregationBuilder(
+            "test_trigger",
+            mutableMapOf("_count" to "_count"),
+            randomScript(source = "params._count > 1"),
+            "composite_agg",
+            null
+        )
+        val trigger = randomBucketLevelTrigger(bucketSelector = bucketSelectorExtAggregationBuilder)
+        val monitor = randomBucketLevelMonitor(triggers = listOf(trigger))
+
+        val inputResultsStr = """
+        {
+          "hits": { "hits": [], "total": { "value": 5, "relation": "eq" }, "max_score": null },
+          "took": 10, "timed_out": false,
+          "aggregations": {
+            "composite_agg": {
+              "buckets": [
+                { "doc_count": 3, "key": { "host": "server1", "status": "200" } },
+                { "doc_count": 2, "key": { "host": "server2", "status": "500" } }
+              ]
+            }
+          }
+        }
+        """.trimIndent()
+
+        val inputResults = parseInputResults(inputResultsStr)
+        var monitorRunResult = MonitorRunResult<BucketLevelTriggerRunResult>(monitor.name, Instant.now(), Instant.now())
+        monitorRunResult = monitorRunResult.copy(inputResults = InputRunResults(listOf(inputResults)))
+        val triggerCtx = BucketLevelTriggerExecutionContext(monitor, trigger, monitorRunResult, clusterSettings = clusterSettings)
+
+        val result = triggerService.runBucketLevelTriggerFromFilteredResponse(monitor, trigger, triggerCtx)
+        assertNull(result.error)
+        assertEquals(2, result.aggregationResultBuckets.size)
+        // Composite keys are joined with "#"
+        assertTrue(result.aggregationResultBuckets.containsKey("server1#200"))
+        assertTrue(result.aggregationResultBuckets.containsKey("server2#500"))
+    }
+
+    fun `test run bucket level trigger from filtered response with empty buckets`() {
+        val bucketSelectorExtAggregationBuilder = BucketSelectorExtAggregationBuilder(
+            "test_trigger",
+            mutableMapOf("_count" to "_count"),
+            randomScript(source = "params._count > 100"),
+            "status_code",
+            null
+        )
+        val trigger = randomBucketLevelTrigger(bucketSelector = bucketSelectorExtAggregationBuilder)
+        val monitor = randomBucketLevelMonitor(triggers = listOf(trigger))
+
+        val inputResultsStr = """
+        {
+          "hits": { "hits": [], "total": { "value": 0, "relation": "eq" }, "max_score": null },
+          "took": 10, "timed_out": false,
+          "aggregations": {
+            "status_code": {
+              "buckets": []
+            }
+          }
+        }
+        """.trimIndent()
+
+        val inputResults = parseInputResults(inputResultsStr)
+        var monitorRunResult = MonitorRunResult<BucketLevelTriggerRunResult>(monitor.name, Instant.now(), Instant.now())
+        monitorRunResult = monitorRunResult.copy(inputResults = InputRunResults(listOf(inputResults)))
+        val triggerCtx = BucketLevelTriggerExecutionContext(monitor, trigger, monitorRunResult, clusterSettings = clusterSettings)
+
+        val result = triggerService.runBucketLevelTriggerFromFilteredResponse(monitor, trigger, triggerCtx)
+        assertNull(result.error)
+        assertTrue(result.aggregationResultBuckets.isEmpty())
+    }
+
+    fun `test run bucket level trigger from filtered response with nested parent path`() {
+        val bucketSelectorExtAggregationBuilder = BucketSelectorExtAggregationBuilder(
+            "test_trigger",
+            mutableMapOf("_count" to "_count"),
+            randomScript(source = "params._count > 0"),
+            "outer>inner",
+            null
+        )
+        val trigger = randomBucketLevelTrigger(bucketSelector = bucketSelectorExtAggregationBuilder)
+        val monitor = randomBucketLevelMonitor(triggers = listOf(trigger))
+
+        val inputResultsStr = """
+        {
+          "hits": { "hits": [], "total": { "value": 2, "relation": "eq" }, "max_score": null },
+          "took": 10, "timed_out": false,
+          "aggregations": {
+            "outer": {
+              "inner": {
+                "buckets": [
+                  { "doc_count": 1, "key": "val1" }
+                ]
+              }
+            }
+          }
+        }
+        """.trimIndent()
+
+        val inputResults = parseInputResults(inputResultsStr)
+        var monitorRunResult = MonitorRunResult<BucketLevelTriggerRunResult>(monitor.name, Instant.now(), Instant.now())
+        monitorRunResult = monitorRunResult.copy(inputResults = InputRunResults(listOf(inputResults)))
+        val triggerCtx = BucketLevelTriggerExecutionContext(monitor, trigger, monitorRunResult, clusterSettings = clusterSettings)
+
+        val result = triggerService.runBucketLevelTriggerFromFilteredResponse(monitor, trigger, triggerCtx)
+        assertNull(result.error)
+        assertEquals(1, result.aggregationResultBuckets.size)
+        assertTrue(result.aggregationResultBuckets.containsKey("val1"))
+    }
+
+    private fun parseInputResults(json: String): Map<String, Any> {
+        val parser = XContentType.JSON.xContent()
+            .createParser(NamedXContentRegistry.EMPTY, DeprecationHandler.THROW_UNSUPPORTED_OPERATION, json)
+        return parser.map()
     }
 }
